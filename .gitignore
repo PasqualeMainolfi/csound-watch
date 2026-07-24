@@ -1,31 +1,31 @@
-  # Build and release output
-  /build/
-  /build-*/
-  /dist/
+# Build and release output
+/build/
+/build-*/
+/dist/
 
-  # Compiled files
-  *.o
-  *.obj
-  *.a
-  *.so
-  *.dylib
-  *.dll
-  *.exe
-  *.lib
-  *.pdb
+# Compiled files
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.lib
+*.pdb
 
-  # CMake-generated files
-  CMakeCache.txt
-  CMakeFiles/
-  cmake_install.cmake
-  CTestTestfile.cmake
-  CPackConfig.cmake
-  CPackSourceConfig.cmake
-  compile_commands.json
+# CMake-generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+compile_commands.json
 
-  # Tool caches
-  /.cache/
+# Tool caches
+/.cache/
 
-  # Operating systems
-  .DS_Store
-  Thumbs.db
+# Operating systems
+.DS_Store
+Thumbs.db
