@@ -1,0 +1,3 @@
+# Hashes of file build rules.
+4fb08201ffad1462aa6c689b880bd09f CMakeFiles/watch_release_package
+8fd0101057d9e37649714fc826587318 generated/watch_font_data.h

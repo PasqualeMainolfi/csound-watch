@@ -1,0 +1,621 @@
+# Csound Watch
+
+Csound Watch is a Csound 7 plugin for real-time signal visualization. It
+provides simple opcodes for creating oscilloscope, spectrum, spectrogram, and
+static function-table windows while keeping all graphics work outside Csound's
+audio thread.
+
+Graphs are created with an init-time opcode and signals are attached with
+`watchadd`:
+
+```csound
+graph:i = watchscope(1, 10, 8, -1, 1, "Oscilloscope")
+
+first:a = oscili(0.7, 220)
+second:a = oscili(0.3, 440)
+
+watchadd(graph, first)
+watchadd(graph, second)
+```
+
+Each graph is displayed in a separate, resizable SDL3 window. When a graph is
+created, the viewer asks the desktop window manager to bring its window to the
+foreground and give it input focus. New windows are arranged in a grid within
+the usable area of the display so simultaneous graphs do not completely cover
+one another. The standalone viewer is launched automatically when it is needed
+and normally terminates shortly after Csound stops.
+
+> [!NOTE]
+> Csound Watch currently targets the Csound 7 plugin API. k-rate plotting is
+> planned but is not part of the current opcode interface.
+
+## Features
+
+- Oscilloscope-style visualization of a-rate signals.
+- Power-spectrum visualization of non-sliding PVS `f`-signals.
+- Scrolling spectrograms from non-sliding PVS `f`-signals.
+- Complete, init-time plotting of function tables.
+- Gain, power, and decibel spectral display scales.
+- Several compatible streams in the same graph.
+- Shared sample timeline for synchronized oscilloscope streams.
+- Resizable windows with automatically generated axis and tick labels.
+- Newly created graph windows are brought to the foreground.
+- Per-graph light and inverted dark themes.
+- Automatic launch and shutdown of the standalone viewer.
+- Support for several simultaneous Csound processes through one viewer.
+- Portable local UDP transport for macOS, Linux, and Windows.
+- No rendering, socket I/O, waiting, or viewer allocation in the audio
+  performance callback.
+
+## How it works
+
+Csound and the viewer run as separate processes:
+
+```text
+Csound audio thread
+        |
+        | copies samples or spectral bins
+        v
+bounded per-stream ring buffer
+        |
+        | dedicated sender thread
+        v
+UDP 127.0.0.1:48120
+        |
+        v
+standalone SDL3 viewer
+```
+
+`watchadd` only copies incoming data into a bounded, preallocated queue. A
+dedicated sender thread removes packets from that queue and sends them to the
+viewer. If the queue is full, new visualization data may be dropped rather than
+blocking audio processing.
+
+`watchtable` takes an init-time snapshot instead. The sender transfers that
+snapshot progressively after the graph configuration is acknowledged, without
+placing the complete table in the streaming ring buffer. The viewer assembles
+chunks by offset and exposes the plot only after every table sample has arrived.
+
+The viewer validates and acknowledges each graph configuration before the
+sender starts streaming data for that graph. Audio packets are accumulated into
+the requested scope window, while spectral packets are reassembled into complete
+PVS frames.
+
+The transport is intended for responsive visualization, not lossless recording.
+
+## Opcodes
+
+| Opcode | Signal domain | Purpose |
+|---|---|---|
+| [`watchscope`](doc/watchscope.md) | Time | Create an oscilloscope graph |
+| [`watchspectrum`](doc/watchspectrum.md) | Frequency | Create a power-spectrum graph |
+| [`watchspectrogram`](doc/watchspectrogram.md) | Time/frequency | Create a scrolling spectrogram |
+| [`watchtable`](doc/watchtable.md) | Table index | Plot a complete function table |
+| [`watchtheme`](doc/watchtheme.md) | Graph appearance | Select the light or dark theme |
+| [`watchadd`](doc/watchadd.md) | Time or frequency | Attach a compatible signal to a graph |
+
+### `watchscope`
+
+```csound
+graph:i = watchscope(win_size:i [, x_ticks:i [, y_ticks:i]])
+graph:i = watchscope(win_size:i, x_ticks:i, y_ticks:i, ymin:i)
+graph:i = watchscope(win_size:i, x_ticks:i, y_ticks:i, ymin:i, ymax:i)
+graph:i = watchscope(win_size:i, x_ticks:i, y_ticks:i, ymin:i, ymax:i, title:S)
+```
+
+`win_size` is the visible duration in seconds. The default amplitude range is
+`-1` through `1`. When only `ymin` is supplied, `ymax` is `ymin + 2`.
+
+`x_ticks` and `y_ticks` control only how many intervals the corresponding axis
+and grid are divided into. They do not determine the number of samples in the
+window. For an audio stream, the nominal number of visible samples is:
+
+```text
+visible samples = win_size × sample rate
+```
+
+For example, `x_ticks = 10` divides the time axis into 10 equal intervals. It
+does not limit the window to 10 samples. The value `0` requests the viewer
+default; explicit values may range from 1 through 256.
+
+Several a-rate signals may be attached to the same scope. Packets carry absolute
+sample positions, allowing the viewer to preserve their relative phase even
+with `ksmps = 1`, large control blocks, or variable packet arrival times.
+
+### `watchspectrum`
+
+```csound
+graph:i = watchspectrum()
+graph:i = watchspectrum(min_freq:i, max_freq:i, min_value:i, max_value:i)
+graph:i = watchspectrum(min_freq:i, max_freq:i, min_value:i, max_value:i, scale:i [, x_ticks:i [, y_ticks:i]])
+graph:i = watchspectrum(min_freq:i, max_freq:i, min_value:i, max_value:i, scale:i, x_ticks:i, y_ticks:i, title:S)
+```
+
+Each complete PVS frame replaces the spectrum currently displayed. With no
+arguments, the frequency range is selected automatically from `0 Hz` to Nyquist
+after the first frame arrives.
+
+The tick arguments affect only grid divisions and labels. They do not change the
+FFT size, the number of spectral bins, or the selected frequency range.
+
+### `watchspectrogram`
+
+```csound
+graph:i = watchspectrogram(history_seconds:i)
+graph:i = watchspectrogram(history_seconds:i, min_freq:i, max_freq:i, min_value:i, max_value:i)
+graph:i = watchspectrogram(history_seconds:i, min_freq:i, max_freq:i, min_value:i, max_value:i, scale:i [, x_ticks:i [, y_ticks:i]])
+graph:i = watchspectrogram(history_seconds:i, min_freq:i, max_freq:i, min_value:i, max_value:i, scale:i, x_ticks:i, y_ticks:i, title:S)
+```
+
+`history_seconds` determines how much spectral history is visible. Each complete
+PVS frame becomes one column, with the newest frame placed at the right edge.
+
+The tick arguments affect only grid divisions and labels. They do not change the
+number of PVS frames retained in the spectrogram history.
+
+### `watchadd`
+
+```csound
+watchadd(graph:i, signal:a)
+watchadd(graph:i, signal:f)
+```
+
+The overload is selected from the signal type:
+
+- a-rate signals can be attached to `watchscope`;
+- non-sliding `f`-signals can be attached to `watchspectrum` or
+  `watchspectrogram`.
+
+Supported PVS formats are amplitude/frequency, amplitude/phase, and complex.
+Sliding PVS signals are not currently supported.
+
+### `watchtable`
+
+```csound
+watchtable table:i [, ymin:i [, ymax:i]]
+watchtable.t table:i, ymin:i, ymax:i, theme:i
+watchtable.s table:i, ymin:i, ymax:i, title:S
+watchtable.ts table:i, ymin:i, ymax:i, theme:i, title:S
+```
+
+`watchtable` snapshots the selected function table at init time and sends it in
+chunks. The x-axis contains table indices. When the y range is omitted, it is
+derived from the completed table. The viewer does not expose a partial plot:
+rendering begins only after every sample has been assembled. `theme` is `0`
+for light and `1` for dark.
+
+### `watchtheme`
+
+```csound
+watchtheme graph:i, theme:i
+```
+
+Set `theme` to `0` for the default light palette or `1` for the dark palette.
+The dark palette is the component-wise inversion of the light palette. Call
+`watchtheme` at init time after creating the graph.
+
+See the individual opcode pages in [`doc`](doc) for complete argument
+descriptions and examples.
+
+## Spectral scales
+
+Watch transports spectral power. `watchspectrum` and `watchspectrogram` can
+display it using one of three scales:
+
+| Value | Scale | Conversion |
+|---:|---|---|
+| `0` | Linear gain | `sqrt(power)` |
+| `1` | Linear power | `power` |
+| `2` | Decibels | `10 * log10(power)` |
+
+The default is linear gain. Automatic display ranges are:
+
+- `0` through `1` for gain and power;
+- `-120` through `0` for decibels.
+
+Values below `-160 dB` are limited to the viewer's floor. The frequency axis is
+currently linear.
+
+## Complete example
+
+The following example creates all three graph types from one signal:
+
+```csound
+<CsoundSynthesizer>
+<CsOptions>
+-odac
+</CsOptions>
+<CsInstruments>
+
+sr = 48000
+ksmps = 32
+nchnls = 2
+0dbfs = 1
+
+instr WatchSignals
+    scope:i = watchscope(0.5, 10, 8, -1, 1, "Waveform")
+    spectrum:i = watchspectrum(
+        20, 12000,
+        -120, 0,
+        2, 10, 8,
+        "Spectrum")
+    spectrogram:i = watchspectrogram(
+        3,
+        20, 12000,
+        -120, 0,
+        2, 8, 8,
+        "Spectrogram")
+
+    signal:a = vco2(0.35, 220)
+    analysis:f = pvsanal(signal, 2048, 256, 2048, 1)
+
+    watchadd(scope, signal)
+    watchadd(spectrum, analysis)
+    watchadd(spectrogram, analysis)
+
+    out(signal, signal)
+endin
+
+</CsInstruments>
+<CsScore>
+i "WatchSignals" 0 20
+</CsScore>
+</CsoundSynthesizer>
+```
+
+Additional ready-to-run files are available in [`examples`](examples):
+
+- [`watchscope.csd`](examples/watchscope.csd)
+- [`watchspectrum.csd`](examples/watchspectrum.csd)
+- [`watchspectrogram.csd`](examples/watchspectrogram.csd)
+- [`watchtable.csd`](examples/watchtable.csd)
+- [`watchadd.csd`](examples/watchadd.csd)
+
+## Runtime requirements
+
+A normal binary release requires:
+
+- Csound 7;
+- the Watch plugin binary;
+- the matching `watch_viewer` executable.
+
+The default release build statically links SDL3, SDL3_ttf, and FreeType into the
+viewer and embeds its font. Users do not need to install those libraries
+separately, and the Csound plugin itself does not link to SDL.
+
+The project currently provides build and packaging support for:
+
+- macOS x86-64 and Apple Silicon;
+- Linux x86-64;
+- Windows x86-64.
+
+## Installation
+
+### Risset
+
+When Watch is available in the Risset index, install it with:
+
+```sh
+risset install watch
+```
+
+The Risset manifest treats the viewer as a platform-specific asset. The plugin
+knows the standard Risset asset location and launches the installed executable
+automatically.
+
+### Prebuilt release
+
+A release archive contains the plugin binary, `watch_viewer` (or
+`watch_viewer.exe`), and the third-party license notices.
+
+The simplest manual installation is to place the viewer next to the plugin.
+Alternatively, install the viewer somewhere in `PATH` or set
+`CSOUND_WATCH_VIEWER` to its complete path.
+
+Csound's default user plugin directories used by this project are:
+
+| Platform | Plugin directory |
+|---|---|
+| macOS | `~/Library/csound/7.0/plugins64` |
+| Linux | `~/.local/lib/csound/7.0/plugins64` |
+| Windows | `%LOCALAPPDATA%\csound\7.0\plugins64` |
+
+## Building from source
+
+### Build requirements
+
+- CMake 3.16 or newer.
+- A C11 compiler.
+- Csound 7 plugin SDK headers, including `csdl.h`.
+- Either the vendored SDL3/SDL3_ttf/FreeType sources or installed SDL3 and
+  SDL3_ttf CMake packages.
+
+The default configuration expects:
+
+```text
+third_party/SDL
+third_party/SDL_ttf
+third_party/SDL_ttf/external/freetype
+third_party/font/AtkinsonHyperlegible-Regular.otf
+```
+
+### Default build
+
+Configure and build the plugin and self-contained viewer:
+
+```sh
+cmake -S . -B build \
+  -DBUILD_WATCH_OPCODES=ON \
+  -DBUILD_WATCH_VIEWER=ON \
+  -DCMAKE_BUILD_TYPE=Release
+
+cmake --build build --target watch watch_viewer -j4
+```
+
+The targets are named `watch` and `watch_viewer` with an underscore.
+
+CMake searches common Csound installation paths. If it cannot find `csdl.h`,
+provide the SDK include directory explicitly:
+
+```sh
+cmake -S . -B build \
+  -DCSOUND_INCLUDE_DIR=/path/to/csound/include
+```
+
+When building against a raw Csound source checkout, `version.h` may live in a
+generated directory. Add it with:
+
+```sh
+cmake -S . -B build \
+  -DCSOUND_INCLUDE_DIR=/path/to/csound/include \
+  -DCSOUND_EXTRA_INCLUDE_DIRS=/path/to/generated/headers
+```
+
+### Build with installed SDL
+
+To use system packages instead of the vendored sources:
+
+```sh
+cmake -S . -B build \
+  -DWATCH_USE_SYSTEM_SDL3=ON \
+  -DBUILD_WATCH_OPCODES=ON \
+  -DBUILD_WATCH_VIEWER=ON
+
+cmake --build build --target watch watch_viewer -j4
+```
+
+This mode requires SDL3 3.4 or newer and SDL3_ttf 3.2 or newer. For distributable
+release archives, use the default vendored build so the viewer remains
+self-contained.
+
+### Build only one component
+
+Viewer only, without requiring Csound headers:
+
+```sh
+cmake -S . -B build \
+  -DBUILD_WATCH_OPCODES=OFF \
+  -DBUILD_WATCH_VIEWER=ON
+
+cmake --build build --target watch_viewer -j4
+```
+
+Plugin only:
+
+```sh
+cmake -S . -B build \
+  -DBUILD_WATCH_OPCODES=ON \
+  -DBUILD_WATCH_VIEWER=OFF
+
+cmake --build build --target watch -j4
+```
+
+The plugin-only build still requires a compatible viewer at runtime.
+
+### Install
+
+The CMake install step copies the plugin into the platform-specific user Csound
+directory and installs the viewer under the selected prefix:
+
+```sh
+cmake --install build --prefix "$HOME/.local"
+```
+
+Make sure the prefix's `bin` directory is in `PATH`, or set
+`CSOUND_WATCH_VIEWER` explicitly.
+
+### Create a release package
+
+With both components enabled, build the dependency-free archive used by GitHub
+Releases and Risset:
+
+```sh
+cmake --build build --target watch_release_package
+```
+
+The archive is written under `build/dist` and contains:
+
+- the platform-specific Csound plugin;
+- the standalone viewer;
+- SDL3, SDL3_ttf, FreeType, and font license notices.
+
+## Running from the build directory
+
+On macOS or Linux:
+
+```sh
+OPCODE7DIR64="$PWD/build" csound examples/watchscope.csd
+```
+
+In Windows PowerShell:
+
+```powershell
+$env:OPCODE7DIR64 = "$PWD\build"
+csound examples\watchscope.csd
+```
+
+Because the viewer is next to the plugin in the build directory, it is found
+automatically.
+
+The viewer can also be launched independently:
+
+```sh
+./build/watch_viewer
+```
+
+Only one viewer can bind the local UDP endpoint at a time. A running viewer can
+serve multiple graphs and multiple Csound processes.
+
+## Viewer discovery and lifecycle
+
+When the first graph is created, the sender thread transmits its configuration
+and gives an existing viewer 150 ms to acknowledge it. If no acknowledgement
+arrives, the sender thread launches the viewer without blocking the audio
+performance callback.
+
+The executable is resolved in this order:
+
+1. the path stored in `CSOUND_WATCH_VIEWER`;
+2. an executable next to the plugin;
+3. the standard Risset asset directory;
+4. `watch_viewer` or `watch_viewer.exe` found through `PATH`.
+
+Every `watchscope`, `watchspectrum`, `watchspectrogram`, or `watchtable` call
+creates a new graph window. The viewer requests that each new window be raised
+and focused; the final decision remains subject to the desktop window manager's
+focus-stealing policy. Windows are assigned grid positions in the usable area
+of the display; positions are reused when there are more windows than available
+grid cells. Windows may be closed manually.
+
+When a Csound session ends, it sends a session-close message three times. The
+viewer closes only the windows belonging to that session. If no graphs remain,
+it waits 500 ms before terminating; a new configuration received during that
+interval cancels shutdown. Closing the last window manually terminates the
+viewer immediately.
+
+## Technical specifications and limits
+
+| Property | Value |
+|---|---|
+| Csound API | 7 |
+| Network transport | UDP over loopback |
+| Viewer endpoint | `127.0.0.1:48120` |
+| Protocol version | 3 |
+| Maximum graphs per Csound instance | 32 |
+| Maximum open graphs in one viewer | 32 across all Csound sessions |
+| Maximum streams per graph | 64 |
+| Audio samples per packet | Up to 256 |
+| Spectral bins per packet | Up to 256 |
+| Function-table samples per packet | Up to 256 |
+| Maximum function-table size | 1,073,741,824 samples (`Csound MAXLEN`) |
+| Per-stream sender queue | 50 bounded slots |
+| Viewer refresh rate | 60 Hz |
+| Scope render latency | Approximately 50 ms |
+| Default window size | 600 × 400 |
+| Minimum window size | 360 × 260 |
+| Default axis/grid divisions | 10 horizontal, 8 vertical |
+| Maximum axis/grid divisions | 256 per axis; unrelated to sample or FFT-bin counts |
+| Maximum title length | 383 bytes plus terminator |
+| Spectral dB floor | `-160 dB` |
+
+Large control blocks, FFT frames, and function tables are divided across
+multiple UDP packets. Function-table packets carry their sample offset and
+transfer size; the viewer displays the plot only after the transfer is complete.
+
+The viewer validates packet magic, protocol version, type, payload length,
+graph/stream identifiers, sample rate, FFT metadata, ranges, and title
+termination before accepting data.
+
+## Troubleshooting
+
+### `csdl.h` not found
+
+Install the Csound 7 development headers or configure with:
+
+```sh
+cmake -S . -B build \
+  -DCSOUND_INCLUDE_DIR=/path/to/csound/include
+```
+
+### `version.h` not found
+
+When using a Csound source checkout, point CMake at the generated header:
+
+```sh
+cmake -S . -B build \
+  -DCSOUND_INCLUDE_DIR=/path/to/csound/include \
+  -DCSOUND_EXTRA_INCLUDE_DIRS=/directory/containing/version.h
+```
+
+### Csound reports that an opcode does not exist
+
+Confirm that Csound is loading the build or installation directory:
+
+```sh
+OPCODE7DIR64="$PWD/build" csound examples/watchscope.csd
+```
+
+Also confirm that the plugin was built against the Csound 7 API and with the
+same `MYFLT` precision as the running Csound installation. `USE_DOUBLE` is
+enabled by default.
+
+### The viewer cannot be launched
+
+Keep the viewer next to the plugin or provide its absolute path:
+
+```sh
+CSOUND_WATCH_VIEWER="/absolute/path/to/watch_viewer" csound example.csd
+```
+
+On Windows:
+
+```powershell
+$env:CSOUND_WATCH_VIEWER = "C:\absolute\path\watch_viewer.exe"
+csound example.csd
+```
+
+### UDP bind fails
+
+Another viewer or process is probably using `127.0.0.1:48120`. Normally a single
+viewer should be shared by all running Csound sessions. Stop the stale process
+and launch the example again.
+
+### Data is occasionally missing
+
+The sender queues are intentionally bounded. If the viewer or sender cannot keep
+up, visualization packets are dropped to protect real-time audio performance.
+Watch is not designed as a signal recorder.
+
+## Documentation
+
+- [Overview and architecture](doc/index.md)
+- [`watchscope`](doc/watchscope.md)
+- [`watchspectrum`](doc/watchspectrum.md)
+- [`watchspectrogram`](doc/watchspectrogram.md)
+- [`watchtable`](doc/watchtable.md)
+- [`watchtheme`](doc/watchtheme.md)
+- [`watchadd`](doc/watchadd.md)
+
+## Roadmap
+
+- k-rate/control-signal graphs;
+- further rendering and labeling refinements while keeping the interface simple.
+
+## Dependencies and licenses
+
+The Watch plugin is distributed under the LGPL as declared in
+[`risset.json`](risset.json).
+
+The default viewer build includes:
+
+- SDL3;
+- SDL3_ttf;
+- FreeType;
+- Atkinson Hyperlegible.
+
+Their license notices are included in generated release archives under
+`licenses/`.
+
+## Author
+
+Pasquale Mainolfi, 2026

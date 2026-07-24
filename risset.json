@@ -1,0 +1,73 @@
+{
+  "name": "watch",
+  "version": "1.0.0",
+  "opcodes": [
+    "watchtable",
+    "watchscope",
+    "watchspectrum",
+    "watchspectrogram",
+    "watchadd",
+    "watchtheme"
+  ],
+  "short_description": "Real-time signal plotting in a separate SDL3 viewer",
+  "long_description": "Csound opcodes that stream signal data over local UDP to a standalone plotting viewer.",
+  "author": "Pasquale Mainolfi",
+  "email": "mnlpql@gmail.com",
+  "license": "LGPL",
+  "repository": "https://github.com/PasqualeMainolfi/csound-watch",
+  "binaries": [
+    {
+      "platform": "linux-x86_64",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v${version}/watch-csound7-linux-x86_64.zip",
+      "extractpath": "libwatch.so",
+      "csound_version": ">=7.0"
+    },
+    {
+      "platform": "windows-x86_64",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v${version}/watch-csound7-windows-x86_64.zip",
+      "extractpath": "watch.dll",
+      "build_platform": "windows 11",
+      "csound_version": ">=7.0"
+    },
+    {
+      "platform": "macos-x86_64",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v${version}/watch-csound7-macos-universal.zip",
+      "extractpath": "libwatch.dylib",
+      "build_platform": "25.6.1",
+      "csound_version": ">=7.0"
+    },
+    {
+      "platform": "macos-arm64",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v${version}/watch-csound7-macos-universal.zip",
+      "extractpath": "libwatch.dylib",
+      "build_platform": "25.6.1",
+      "csound_version": ">=7.0"
+    }
+  ],
+  "assets": [
+    {
+      "name": "watch-viewer-linux-x86_64",
+      "platform": "linux-x86_64",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v1.0.0/watch-csound7-linux-x86_64.zip",
+      "extractpath": "watch_viewer"
+    },
+    {
+      "name": "watch-viewer-windows-x86_64",
+      "platform": "windows-x86_64",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v1.0.0/watch-csound7-windows-x86_64.zip",
+      "extractpath": "watch_viewer.exe"
+    },
+    {
+      "name": "watch-viewer-macos-x86_64",
+      "platform": "macos-x86_64",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v1.0.0/watch-csound7-macos-universal.zip",
+      "extractpath": "watch_viewer"
+    },
+    {
+      "name": "watch-viewer-macos-arm64",
+      "platform": "macos-arm64",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v1.0.0/watch-csound7-macos-universal.zip",
+      "extractpath": "watch_viewer"
+    }
+  ]
+}
