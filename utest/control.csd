@@ -1,6 +1,6 @@
 <CsoundSynthesizer>
 <CsOptions>
--odac -m0
+-odac -m0 --run-unit-tests
 </CsOptions>
 <CsInstruments>
 

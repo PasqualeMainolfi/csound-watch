@@ -68,10 +68,11 @@ standalone SDL3 viewer
 
 `watchadd` only copies incoming data into a bounded, preallocated queue. Audio
 samples are packetized as they arrive. Control samples are accumulated into
-batches of up to 256 values; a final partial batch is published when the graph
-ends. A dedicated sender thread removes packets from the queue and sends them to
-the viewer. If the queue is full, new visualization data may be dropped rather
-than blocking Csound's performance thread.
+batches of up to 256 values; a final partial batch is published when the
+attaching instrument instance ends. A dedicated sender thread removes packets
+from the queue and sends them to the viewer. If the queue is full, new
+visualization data may be dropped rather than blocking Csound's performance
+thread.
 
 `watchtable` takes an init-time snapshot instead. The sender transfers that
 snapshot progressively after the graph configuration is acknowledged, without
@@ -139,8 +140,8 @@ graph:i = watchcontrol(win_size:i, x_ticks:i, y_ticks:i, ymin:i, ymax:i, title:S
 `-1` through `1`. The x-axis is labelled `Time (s)` and the y-axis `Value`.
 
 One value is collected per k-cycle. Values are accumulated into packets of 256
-samples before transmission; a discontinuity or graph shutdown publishes a
-shorter final packet. Consequently, packet batching adds up to approximately
+samples before transmission; a discontinuity, or the end of the attaching
+instrument instance, publishes a shorter final packet. Consequently, packet batching adds up to approximately
 `256 / kr` seconds of latency before a new batch becomes available to the
 sender. Tick arguments affect only the grid and labels.
 
@@ -196,15 +197,17 @@ Sliding PVS signals are not currently supported.
 ### `watchtable`
 
 ```csound
-watchtable table:i [, ymin:i [, ymax:i]]
+watchtable table:i
+watchtable.m table:i, ymin:i
+watchtable.mm table:i, ymin:i, ymax:i
 watchtable.t table:i, ymin:i, ymax:i, theme:i
 watchtable.s table:i, ymin:i, ymax:i, title:S
 watchtable.ts table:i, ymin:i, ymax:i, theme:i, title:S
 ```
 
 `watchtable` snapshots the selected function table at init time and sends it in
-chunks. The x-axis contains table indices. When the y range is omitted, it is
-derived from the completed table. The viewer does not expose a partial plot:
+chunks. The x-axis contains table indices. A limit that is left out of the call
+is derived from the completed table. The viewer does not expose a partial plot:
 rendering begins only after every sample has been assembled. `theme` is `0`
 for light and `1` for dark.
 
@@ -497,6 +500,31 @@ The viewer can also be launched independently:
 Only one viewer can bind the local UDP endpoint at a time. A running viewer can
 serve multiple graphs and multiple Csound processes.
 
+## Tests
+
+The [`utest`](utest) directory holds `.csd` files that exercise one area each.
+They are run like any other orchestra and, where the checks are numeric, report
+a summary through Csound's `--run-unit-tests` assertion opcodes:
+
+```sh
+OPCODE7DIR64="$PWD/build" csound utest/registry.csd
+```
+
+| File | Area |
+|---|---|
+| [`registry.csd`](utest/registry.csd) | Handle allocation and graph-registry capacity |
+| [`scope_stream.csd`](utest/scope_stream.csd) | Audio streams at `ksmps = 1` and file playback |
+| [`control.csd`](utest/control.csd) | Control packets, multiple streams, residual flush |
+| [`control_ranges.csd`](utest/control_ranges.csd) | Asymmetric and strictly positive y ranges, `expseg` envelopes |
+| [`spectral.csd`](utest/spectral.csd) | Spectrum and spectrogram graph creation |
+| [`spectral_audio.csd`](utest/spectral_audio.csd) | Spectral streams fed by real audio |
+| [`table_gens.csd`](utest/table_gens.csd) | GEN5, GEN7 and GEN8 tables with automatic and explicit ranges |
+| [`ftable_transfer.csd`](utest/ftable_transfer.csd) | Deferred table transfer and graph cleanup |
+| [`theme.csd`](utest/theme.csd) | Light and dark themes |
+
+The graph tests are also visual: `control_ranges.csd` and `table_gens.csd`
+carry the expected zero-line position in each window title.
+
 ## Viewer discovery and lifecycle
 
 When the first graph is created, the sender thread transmits its configuration
@@ -531,10 +559,10 @@ viewer immediately.
 | Csound API | 7 |
 | Network transport | UDP over loopback |
 | Viewer endpoint | `127.0.0.1:48120` |
-| Protocol version | 3 |
+| Protocol version | 4 |
 | Maximum graphs per Csound instance | 32 |
 | Maximum open graphs in one viewer | 32 across all Csound sessions |
-| Maximum streams per graph | 64 |
+| Maximum streams per graph | 64 concurrent; a slot is released when the attaching instance ends |
 | Audio samples per packet | Up to 256 |
 | Control samples per packet | Up to 256 |
 | Spectral bins per packet | Up to 256 |

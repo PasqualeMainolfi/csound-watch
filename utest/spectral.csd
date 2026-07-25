@@ -1,6 +1,6 @@
 <CsoundSynthesizer>
 <CsOptions>
--o dac2
+-o dac2 --run-unit-tests
 </CsOptions>
 <CsInstruments>
 sr = 44100
@@ -14,14 +14,14 @@ instr SpectralGraphs
     spectrum_full:i = watchspectrum(0, 22050, 0, 1, 0, 8, 8, "Spectrum")
     spectrogram_full:i = watchspectrogram(2, 0, 22050, -120, 0, 2, 8, 8, "Spectrogram")
 
-    assert_true(ispectrum != 0)
-    assert_true(ispectrogram != 0)
-    assert_true(ispectrum_full != 0)
-    assert_true(ispectrogram_full != 0)
+    assert_true(spectrum != 0)
+    assert_true(spectrogram != 0)
+    assert_true(spectrum_full != 0)
+    assert_true(spectrogram_full != 0)
 
     signal:a = oscili(0.2, 440)
-    sig:f = pvsanal(asignal, 1024, 256, 1024, 1)
-    watchadd(spectrum, signal)
+    sig:f = pvsanal(signal, 1024, 256, 1024, 1)
+    watchadd(spectrum, sig)
     watchadd(spectrogram, sig)
     watchadd(spectrum_full, sig)
     watchadd(spectrogram_full, sig)

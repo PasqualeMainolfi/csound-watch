@@ -25,11 +25,17 @@ table. The protocol accepts up to Csound's maximum table length:
 ## Syntax
 
 ```csound
-watchtable table:i [, ymin:i [, ymax:i]]
+watchtable table:i
+watchtable.m table:i, ymin:i
+watchtable.mm table:i, ymin:i, ymax:i
 watchtable.t table:i, ymin:i, ymax:i, theme:i
 watchtable.s table:i, ymin:i, ymax:i, title:S
 watchtable.ts table:i, ymin:i, ymax:i, theme:i, title:S
 ```
+
+Each limit is either supplied or left out of the call; there is no value that
+means "automatic". `watchtable ift` derives both limits from the table, and
+`watchtable ift, 0` derives only the upper one.
 
 ## Arguments
 

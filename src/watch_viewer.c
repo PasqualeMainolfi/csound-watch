@@ -25,7 +25,6 @@
 #define MINIMUM_HEIGTH 260
 #define MAX_VIEWER_GRAPHS 32
 #define MAX_PACKETS_PER_FRAME 4096
-#define MAX_GRID_TICKS 256
 #define DEFAULT_X_TICKS 10
 #define DEFAULT_Y_TICKS 8
 #define VIEWER_REFRESH_HZ 60U
@@ -115,7 +114,7 @@ typedef struct {
     uint32_t valid_samples;
     float ymin;
     float ymax;
-    uint32_t sample_rate;
+    float sample_rate;
     uint64_t total_samples;
     int64_t next_sequence;
     bool has_sequence;
@@ -968,13 +967,18 @@ static void free_ftable_buffers(STREAM_FTABLE_BUFFER *buffers) {
     free(buffers);
 }
 
-static bool ensure_scope_buffer(STREAM_TIME_BUFFER *stream, float win_size, uint32_t sample_rate, float ymin, float ymax) {
+static uint64_t scope_latency_samples(float sample_rate) {
+    double samples = ceil((double) sample_rate * SCOPE_RENDER_LATENCY_MS / 1000.0);
+    return samples > 0.0 ? (uint64_t) samples : 0U;
+}
+
+static bool ensure_scope_buffer(STREAM_TIME_BUFFER *stream, float win_size, float sample_rate, float ymin, float ymax) {
     double requested_length = (double) win_size * (double) sample_rate;
     if (!isfinite(requested_length) || requested_length <= 0.0 || requested_length > (double) INT_MAX) {
         return false;
     }
     uint32_t window_samples = (uint32_t) ceil(requested_length);
-    uint64_t latency_samples = ((uint64_t) sample_rate * SCOPE_RENDER_LATENCY_MS + 999U) / 1000U;
+    uint64_t latency_samples = scope_latency_samples(sample_rate);
     uint64_t requested_capacity = (uint64_t) window_samples + latency_samples + MAX_STREAM_SAMPLES;
     if (requested_capacity > INT_MAX) {
         return false;
@@ -1153,7 +1157,7 @@ static bool advance_scope_timeline(VIEW_GRAPH *graph, uint64_t now_ns) {
     double latest_safe_sample = 0.0;
     double latest_received_sample = 0.0;
     double minimum_full_window_end = 0.0;
-    uint32_t timeline_sample_rate = 0U;
+    float timeline_sample_rate = 0.0f;
     bool found_stream = false;
     bool found_full_window = false;
 
@@ -1163,7 +1167,7 @@ static bool advance_scope_timeline(VIEW_GRAPH *graph, uint64_t now_ns) {
             continue;
         }
 
-        uint64_t latency_samples = ((uint64_t) stream->sample_rate * SCOPE_RENDER_LATENCY_MS + 999U) / 1000U;
+        uint64_t latency_samples = scope_latency_samples(stream->sample_rate);
         double stream_latest = (double) stream->next_sequence - (double) latency_samples;
         if (!found_stream || stream_latest < latest_safe_sample) {
             latest_safe_sample = stream_latest;
@@ -1201,7 +1205,7 @@ static bool advance_scope_timeline(VIEW_GRAPH *graph, uint64_t now_ns) {
     } else {
         uint64_t elapsed_ns = now_ns - graph->scope_last_render_ns;
         graph->scope_display_end_sample +=
-            ((double) elapsed_ns * timeline_sample_rate)
+            ((double) elapsed_ns * (double) timeline_sample_rate)
             / NANOSECONDS_PER_SECOND;
         graph->scope_last_render_ns = now_ns;
     }
@@ -1734,7 +1738,8 @@ static bool validate_data_packet(const WATCH_DATA_PACKET *packet, int64_t receiv
         || packet->header.sequence < 0
         || packet->data.graph_id == 0U
         || packet->data.stream_id >= MAX_STREAMS
-        || packet->data.sample_rate == 0U
+        || !isfinite(packet->data.sample_rate)
+        || packet->data.sample_rate <= 0.0f
         || packet->data.sample_count == 0U
         || packet->data.sample_count > MAX_STREAM_SAMPLES) {
         return false;
@@ -2211,11 +2216,11 @@ static void process_data_packet(
     if (!ensure_scope_buffer(stream, config->win_size, packet->data.sample_rate, ymin, ymax)) {
         SDL_Log(
             "[watch-viewer] graph %u stream %u buffer initialization failed "
-            "(window %.6g s, sample rate %u Hz)",
+            "(window %.6g s, sample rate %.6g Hz)",
             packet->data.graph_id,
             packet->data.stream_id,
             (double) config->win_size,
-            packet->data.sample_rate);
+            (double) packet->data.sample_rate);
         return;
     }
 

@@ -17,8 +17,9 @@ The nominal number of visible values is `win_size * kr`.
 
 One value is collected on every k-cycle. Watch accumulates 256 values before
 publishing a complete packet to the sender thread. A control-timeline
-discontinuity publishes the current partial packet, and graph shutdown publishes
-the final residual packet. This batching adds up to approximately `256 / kr`
+discontinuity publishes the current partial packet, and the end of the
+attaching instrument instance publishes the final residual packet. This
+batching adds up to approximately `256 / kr`
 seconds of latency before a new complete packet becomes available to the
 sender.
 
@@ -40,11 +41,11 @@ graph:i = watchcontrol(win_size:i [, x_ticks:i [, y_ticks:i [, ymin:i [, ymax:i 
 
 * `win_size:i`: visible signal duration in seconds. Must be greater than zero.
 * `x_ticks:i` (optional): whole number of horizontal axis/grid divisions, from
-  `0` through `256`. It affects only the grid and tick labels. `0` selects the
-  viewer default of 10.
+  `0` through `256`; a value outside that range is an init error. It affects
+  only the grid and tick labels. `0` selects the viewer default of 10.
 * `y_ticks:i` (optional): whole number of vertical axis/grid divisions, from
-  `0` through `256`. It affects only the grid and tick labels. `0` selects the
-  viewer default of 8.
+  `0` through `256`; a value outside that range is an init error. It affects
+  only the grid and tick labels. `0` selects the viewer default of 8.
 * `ymin:i` (optional): lower value limit. When supplied without `ymax`, the
   upper limit is `ymin + 2`.
 * `ymax:i` (optional): upper value limit. It must be greater than `ymin`.

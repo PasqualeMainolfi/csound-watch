@@ -57,7 +57,8 @@ graph:i = watchspectrogram(history_seconds:i, min_freq:i, max_freq:i, min_value:
 * `x_ticks:i` (optional): whole number of time axis/grid divisions, from `0`
   through `256`. `0` selects the viewer default of 10.
 * `y_ticks:i` (optional): whole number of frequency axis/grid divisions, from
-  `0` through `256`. `0` selects the viewer default of 8.
+  `0` through `256`; a value outside that range is an init error. `0` selects
+  the viewer default of 8.
 * `title:S` (optional): window title. The default title is
   `Csound Signal-Watcher`. A title must occupy fewer than 384 bytes.
 

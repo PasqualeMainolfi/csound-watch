@@ -8,7 +8,8 @@
 #define MAX_STREAMS 64
 #define MAX_TITLE_SIZE 384
 #define MAX_FTABLE_SAMPLES (1U << 30)
-#define PROT_VERSION 3
+#define MAX_GRID_TICKS 256U
+#define PROT_VERSION 4
 #define WATCH_MAGIC 0x57415448
 // local address
 #define WATCH_VIEWER_ADDRESS "127.0.0.1"
@@ -65,7 +66,7 @@ typedef struct {
 typedef struct {
     uint32_t graph_id;
     uint32_t stream_id;
-    uint32_t sample_rate;
+    float sample_rate; // a-rate or k-rate; fractional control rates are common
     uint32_t sample_count;
     float samples[MAX_STREAM_SAMPLES];
 } WATCH_MSG_DATA;

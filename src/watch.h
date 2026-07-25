@@ -26,6 +26,9 @@
 
 // TODO: add signal label non-optional
 // CHECK: maybe min/max auto is a wrong idea cause min/max is local
+// add log spaced freqs in spctrum e spectrogram
+// add watchpoint -> plane
+// add watchchannel
 
 
 typedef enum {
@@ -45,9 +48,10 @@ typedef union {
 typedef struct {
     uint32_t graph_id;
     uint32_t stream_id;
-    uint32_t sample_rate;
+    float sample_rate;
+    bool release_requested;
     WATCH_STREAM_PACKET slots[MAX_QUEUE_SIZE];
-    uint32_t pending_time_samples;
+    atomic_uint pending_time_samples;
     int64_t pending_time_sequence;
     atomic_uint write_pos;
     atomic_uint read_pos;
@@ -181,20 +185,62 @@ typedef struct {
     MYFLT *theme;
 } WATCH_THEME;
 
+typedef struct {
+    OPDS h;
+    // outputs
+    MYFLT *handle;
+    // inputs
+    MYFLT *xmin;
+    MYFLT *xmax;
+    MYFLT *ymin;
+    MYFLT *ymax;
+    STRINGDAT *title;
+} WATCH_CREATE_POINT;
+
+typedef struct {
+    OPDS h;
+    // inputs
+    MYFLT *handle;
+    MYFLT *x;
+    MYFLT *y;
+} WATCH_ADD_POINT;
+
+typedef struct {
+    OPDS h;
+    // outputs
+    MYFLT *handle;
+    // inputs
+    MYFLT *nchnls;
+    MYFLT *max_value;
+    MYFLT *scale; // linear or db
+    STRINGDAT *title;
+} WATCH_CREATE_METER;
+
+typedef struct {
+    OPDS h;
+    // inputs
+    MYFLT *handle;
+    ARRAYDAT *channels; // k-gains
+} WATCH_ADD_METER;
+
 
 // INTERFACE
 
-int32_t watch_create_control(CSOUND *csound, WATCH_CREATE_TIME *p); // i-time
-int32_t watch_create_scope(CSOUND *csound, WATCH_CREATE_TIME *p); // i-time
-int32_t watch_create_spectrum(CSOUND *csound, WATCH_CREATE_SPECTRAL *p); // i-time
+int32_t watch_create_control(CSOUND *csound, WATCH_CREATE_TIME *p);            // i-time
+int32_t watch_create_scope(CSOUND *csound, WATCH_CREATE_TIME *p);              // i-time
+int32_t watch_create_spectrum(CSOUND *csound, WATCH_CREATE_SPECTRAL *p);       // i-time
 int32_t watch_create_spectrogram(CSOUND *csound, WATCH_CREATE_SPECTROGRAM *p); // i-time
-int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p); // i-time
+int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p);                         // i-time
+int32_t watch_create_point(CSOUND *csound, WATCH_CREATE_POINT *p);             // i-time
+int32_t watch_create_meter(CSOUND *csound, WATCH_CREATE_METER *p);             // i-time
+int32_t watch_theme(CSOUND *csound, WATCH_THEME *p);                           // i-time
 
-int32_t watch_theme(CSOUND *csound, WATCH_THEME *p); // i-time
 
-int32_t watch_add_a(CSOUND *csound, WATCH_ADD_TIME *p); // k-time
-int32_t watch_add_k(CSOUND *csound, WATCH_ADD_TIME *p); // k-time
+int32_t watch_add_a(CSOUND *csound, WATCH_ADD_TIME *p);     // k-time
+int32_t watch_add_k(CSOUND *csound, WATCH_ADD_TIME *p);     // k-time
 int32_t watch_add_f(CSOUND *csound, WATCH_ADD_SPECTRAL *p); // k-time
+int32_t watch_add_p(CSOUND *csound, WATCH_ADD_POINT *p);    // k-time
+int32_t watch_add_ch(CSOUND *csound, WATCH_ADD_METER *p);   // k-time
 
 
 #endif

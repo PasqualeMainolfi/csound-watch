@@ -27,9 +27,6 @@ _Static_assert(
     "session-close packet header must be contiguous with its payload"
 );
 
-static void publish_time_packet(WATCH_STREAM *stream, unsigned next_write);
-
-
 static void try_launch_viewer(WATCH_MANAGER *manager, uint64_t now_ms) {
     if (manager->viewer_probe_started_ms == UINT64_MAX) {
         manager->viewer_probe_started_ms = now_ms;
@@ -66,6 +63,14 @@ static int32_t string_to_title(char *dest, const STRINGDAT *src) {
     return OK;
 }
 
+static void free_stream(CSOUND *csound, WATCH_STREAM *stream) {
+    if (stream == NULL) {
+        return;
+    }
+    csound->Free(csound, stream->ftable_samples);
+    csound->Free(csound, stream);
+}
+
 static void free_graph(CSOUND *csound, WATCH_GRAPH *graph) {
     if (graph == NULL) {
         return;
@@ -73,10 +78,7 @@ static void free_graph(CSOUND *csound, WATCH_GRAPH *graph) {
 
     if (graph->streams != NULL) {
         for (uint32_t i = 0; i < MAX_STREAMS; i++) {
-            if (graph->streams[i] != NULL) {
-                csound->Free(csound, graph->streams[i]->ftable_samples);
-                csound->Free(csound, graph->streams[i]);
-            }
+            free_stream(csound, graph->streams[i]);
         }
         csound->Free(csound, graph->streams);
     }
@@ -272,27 +274,46 @@ static void send_ftable_packets(WATCH_MANAGER *manager, WATCH_STREAM *stream) {
     }
 }
 
-static bool graph_transfer_complete(const WATCH_GRAPH *graph) {
-    if (graph->stream_count == 0U) {
-        return true;
+static bool stream_transfer_complete(const WATCH_STREAM *stream) {
+    unsigned read =
+        atomic_load_explicit(&stream->read_pos, memory_order_relaxed);
+    unsigned write =
+        atomic_load_explicit(&stream->write_pos, memory_order_acquire);
+    return read == write
+        && atomic_load_explicit(&stream->pending_time_samples, memory_order_relaxed) == 0U
+        && stream->ftable_next_sample >= stream->ftable_total_samples;
+}
+
+static bool graph_has_streams(const WATCH_GRAPH *graph) {
+    for (uint32_t i = 0U; i < MAX_STREAMS; i++) {
+        if (graph->streams[i] != NULL) {
+            return true;
+        }
     }
-    for (uint32_t i = 0U; i < graph->stream_count; i++) {
-        const WATCH_STREAM *stream = graph->streams[i];
-        if (stream == NULL) {
+    return false;
+}
+
+/*
+ * A stream outlives the opcode instance that feeds it only until the queued
+ * packets reach the socket. Releasing the slot here keeps the graph usable by
+ * later instrument instances, and keeping the stream alive until its owner has
+ * deinitialized stops the graph from being freed under a running watchadd.
+ */
+static void release_finished_streams(CSOUND *csound, WATCH_GRAPH *graph) {
+    for (uint32_t i = 0U; i < MAX_STREAMS; i++) {
+        WATCH_STREAM *stream = graph->streams[i];
+        if (stream == NULL
+            || !stream->release_requested
+            || !stream_transfer_complete(stream)) {
             continue;
         }
 
-        unsigned read =
-            atomic_load_explicit(&stream->read_pos, memory_order_relaxed);
-        unsigned write =
-            atomic_load_explicit(&stream->write_pos, memory_order_acquire);
-        if (read != write
-            || stream->pending_time_samples > 0U
-            || stream->ftable_next_sample < stream->ftable_total_samples) {
-            return false;
+        graph->streams[i] = NULL;
+        if (graph->stream_count > 0U) {
+            graph->stream_count--;
         }
+        free_stream(csound, stream);
     }
-    return true;
 }
 
 static uintptr_t sender_thread_main(void *user_data) {
@@ -328,16 +349,17 @@ static uintptr_t sender_thread_main(void *user_data) {
                 continue;
             }
 
-            for (uint32_t stream_index = 0; stream_index < graph->stream_count; stream_index++) {
+            for (uint32_t stream_index = 0; stream_index < MAX_STREAMS; stream_index++) {
                 WATCH_STREAM *stream = graph->streams[stream_index];
                 if (stream != NULL) {
                     send_stream_packets(manager, stream);
                     send_ftable_packets(manager, stream);
                 }
             }
+            release_finished_streams(csound, graph);
 
             if (graph->destroy_requested
-                && graph_transfer_complete(graph)) {
+                && !graph_has_streams(graph)) {
                 manager->graphs[i] = NULL;
                 if (manager->graph_count > 0U) {
                     manager->graph_count--;
@@ -557,8 +579,8 @@ static int32_t tick_count(CSOUND *csound, const MYFLT *value, const char *name, 
         return OK;
     }
 
-    if (!isfinite((double) *value) || *value < FL(0.0) || *value > (MYFLT) UINT32_MAX) {
-        return csound->InitError(csound, "[watch] %s must be between 0 and %u", name, UINT32_MAX);
+    if (!isfinite((double) *value) || *value < FL(0.0) || *value > (MYFLT) MAX_GRID_TICKS) {
+        return csound->InitError(csound, "[watch] %s must be between 0 and %u", name, MAX_GRID_TICKS);
     }
 
     *result = (uint32_t) *value;
@@ -667,25 +689,14 @@ static int32_t watch_deinit(CSOUND *csound, WATCH_CREATE_TIME *p) {
     WATCH_MANAGER *manager = csound->QueryGlobalVariable(csound, REGISTRY_NAME);
     if (manager != NULL) {
         csound->LockMutex(manager->registry_mutex);
-        for (uint32_t i = 0; i < manager->graph_capacity; i++) {
-            WATCH_GRAPH *graph = manager->graphs[i];
-            if (graph != NULL && graph->data_config.config.graph_id == graph_id) {
-                for (uint32_t stream_index = 0U; stream_index < graph->stream_count; stream_index++) {
-                    WATCH_STREAM *stream = graph->streams[stream_index];
-
-                    if (stream == NULL || stream->pending_time_samples == 0U) {
-                        continue;
-                    }
-
-                    unsigned write = atomic_load_explicit(&stream->write_pos, memory_order_relaxed);
-                    unsigned next_write = (write + 1U) % MAX_QUEUE_SIZE;
-                    publish_time_packet(stream, next_write);
-                }
-                graph->destroy_requested = true;
-                break;
-            }
+        WATCH_GRAPH *graph = find_graph(manager, graph_id);
+        if (graph != NULL) {
+            /*
+             * The graph is dropped by the sender thread once every stream has
+             * been released by its own watchadd instance and drained.
+             */
+            graph->destroy_requested = true;
         }
-
         csound->UnlockMutex(manager->registry_mutex);
     }
 
@@ -837,7 +848,7 @@ static int32_t create_stream(
     const MYFLT *handle,
     WATCH_SIGNAL_DOMAIN first_domain,
     WATCH_SIGNAL_DOMAIN second_domain,
-    uint32_t sample_rate,
+    float sample_rate,
     WATCH_STREAM **result
 ) {
     *result = NULL;
@@ -855,7 +866,7 @@ static int32_t create_stream(
 
     WATCH_GRAPH *graph = find_graph(manager, (uint32_t) *handle);
 
-    if (graph == NULL) {
+    if (graph == NULL || graph->destroy_requested) {
         csound->UnlockMutex(manager->registry_mutex);
         csound->Free(csound, s);
         return csound->InitError(csound, "[watch] invalid graph handle");
@@ -868,22 +879,32 @@ static int32_t create_stream(
         return csound->InitError(csound, "[watch] signal type does not match graph domain");
     }
 
-    if (graph->stream_count >= MAX_STREAMS) {
+    // slots left behind by finished instrument instances are reused
+    uint32_t stream_slot = MAX_STREAMS;
+    for (uint32_t i = 0U; i < MAX_STREAMS; i++) {
+        if (graph->streams[i] == NULL) {
+            stream_slot = i;
+            break;
+        }
+    }
+
+    if (stream_slot == MAX_STREAMS) {
         csound->UnlockMutex(manager->registry_mutex);
         csound->Free(csound, s);
         return csound->InitError(csound, "[watch] graph stream registry full");
     }
 
-    uint32_t stream_slot = graph->stream_count;
     s->graph_id = graph->data_config.config.graph_id;
     s->stream_id = stream_slot;
     s->sample_rate = sample_rate;
 
+    atomic_init(&s->pending_time_samples, 0);
     atomic_init(&s->write_pos, 0);
     atomic_init(&s->read_pos, 0);
     atomic_init(&s->dropped_samples, 0);
 
-    graph->streams[graph->stream_count++] = s;
+    graph->streams[stream_slot] = s;
+    graph->stream_count++;
     csound->UnlockMutex(manager->registry_mutex);
 
     *result = s;
@@ -896,20 +917,62 @@ int32_t watch_add_a_init(CSOUND *csound, WATCH_ADD_TIME *p) {
         p->handle,
         WATCH_DOMAIN_OSCILLOSCOPE,
         WATCH_DOMAIN_OSCILLOSCOPE,
-        (uint32_t) p->h.insdshead->esr,
+        (float) p->h.insdshead->esr,
         &p->stream
     );
 }
 
+static uint32_t pending_time_samples(const WATCH_STREAM *stream) {
+    return atomic_load_explicit(&stream->pending_time_samples, memory_order_relaxed);
+}
+
 static void publish_time_packet(WATCH_STREAM *stream, unsigned next_write) {
-    WATCH_DATA_PACKET *packet = &stream->slots[atomic_load_explicit(&stream->write_pos, memory_order_relaxed)].time;
-    packet->data.sample_count = stream->pending_time_samples;
-    packet->header.payload_size = (uint32_t) offsetof(WATCH_MSG_DATA, samples) + stream->pending_time_samples * (uint32_t) sizeof(float);
-    stream->pending_time_samples = 0U;
+    unsigned write_pos = atomic_load_explicit(&stream->write_pos, memory_order_relaxed);
+    uint32_t pending = pending_time_samples(stream);
+    WATCH_DATA_PACKET *packet = &stream->slots[write_pos].time;
+    packet->data.sample_count = pending;
+    packet->header.payload_size = (uint32_t) offsetof(WATCH_MSG_DATA, samples) + pending * (uint32_t) sizeof(float);
+    atomic_store_explicit(&stream->pending_time_samples, 0U, memory_order_relaxed);
     atomic_store_explicit(&stream->write_pos, next_write, memory_order_release);
 }
 
+/*
+ * Called from the opcode deinitializer: the sender thread keeps the stream
+ * alive until the residual packet and everything already queued has been sent.
+ */
+static void release_stream(CSOUND *csound, WATCH_STREAM **stream_ref) {
+    WATCH_STREAM *stream = *stream_ref;
+    if (stream == NULL) {
+        return;
+    }
+    *stream_ref = NULL;
+
+    WATCH_MANAGER *manager = csound->QueryGlobalVariable(csound, REGISTRY_NAME);
+    if (manager == NULL) {
+        return;
+    }
+
+    csound->LockMutex(manager->registry_mutex);
+    if (pending_time_samples(stream) > 0U) {
+        unsigned write = atomic_load_explicit(&stream->write_pos, memory_order_relaxed);
+        publish_time_packet(stream, (write + 1U) % MAX_QUEUE_SIZE);
+    }
+    stream->release_requested = true;
+    csound->UnlockMutex(manager->registry_mutex);
+}
+
+static int32_t watch_add_deinit(CSOUND *csound, WATCH_ADD_TIME *p) {
+    release_stream(csound, &p->stream);
+    return OK;
+}
+
+static int32_t watch_add_f_deinit(CSOUND *csound, WATCH_ADD_SPECTRAL *p) {
+    release_stream(csound, &p->stream);
+    return OK;
+}
+
 int32_t watch_add_a(CSOUND *csound, WATCH_ADD_TIME *p) {
+    WATCH_STREAM *stream = p->stream;
     uint32_t offset = p->h.insdshead->ksmps_offset;
     uint32_t early = p->h.insdshead->ksmps_no_end;
     uint32_t end = CS_KSMPS - early;
@@ -922,21 +985,22 @@ int32_t watch_add_a(CSOUND *csound, WATCH_ADD_TIME *p) {
     uint32_t source_pos = offset;
     int64_t bstart = csound->GetCurrentTimeSamples(csound);
     while (source_pos < end) {
-        unsigned write = atomic_load_explicit(&p->stream->write_pos, memory_order_relaxed);
+        unsigned write = atomic_load_explicit(&stream->write_pos, memory_order_relaxed);
         unsigned next_write = (write + 1) % MAX_QUEUE_SIZE;
-        WATCH_DATA_PACKET *packet = &p->stream->slots[write].time;
+        WATCH_DATA_PACKET *packet = &stream->slots[write].time;
         int64_t sequence = bstart + (int64_t) source_pos;
+        uint32_t pending = pending_time_samples(stream);
 
-        if (p->stream->pending_time_samples > 0U
-            && sequence != p->stream->pending_time_sequence + (int64_t) p->stream->pending_time_samples) {
-            publish_time_packet(p->stream, next_write);
+        if (pending > 0U
+            && sequence != stream->pending_time_sequence + (int64_t) pending) {
+            publish_time_packet(stream, next_write);
             continue;
         }
 
-        if (p->stream->pending_time_samples == 0U) {
-            unsigned read = atomic_load_explicit(&p->stream->read_pos, memory_order_acquire);
+        if (pending == 0U) {
+            unsigned read = atomic_load_explicit(&stream->read_pos, memory_order_acquire);
             if (next_write == read) {
-                atomic_fetch_add_explicit(&p->stream->dropped_samples, end - source_pos, memory_order_relaxed);
+                atomic_fetch_add_explicit(&stream->dropped_samples, end - source_pos, memory_order_relaxed);
                 break;
             }
 
@@ -945,26 +1009,27 @@ int32_t watch_add_a(CSOUND *csound, WATCH_ADD_TIME *p) {
             packet->header.version = PROT_VERSION;
             packet->header.sequence = sequence;
 
-            packet->data.graph_id = p->stream->graph_id;
-            packet->data.stream_id = p->stream->stream_id;
-            packet->data.sample_rate = p->stream->sample_rate;
-            p->stream->pending_time_sequence = sequence;
+            packet->data.graph_id = stream->graph_id;
+            packet->data.stream_id = stream->stream_id;
+            packet->data.sample_rate = stream->sample_rate;
+            stream->pending_time_sequence = sequence;
         }
 
         uint32_t remaining = end - source_pos;
-        uint32_t available = MAX_STREAM_SAMPLES - p->stream->pending_time_samples;
+        uint32_t available = MAX_STREAM_SAMPLES - pending;
         uint32_t chunk = remaining < available ? remaining : available;
 
         for (uint32_t i = 0; i < chunk; i++) {
             float sample = (float) p->signal[i + source_pos];
-            packet->data.samples[p->stream->pending_time_samples + i] = sample;
+            packet->data.samples[pending + i] = sample;
         }
 
-        p->stream->pending_time_samples += chunk;
+        pending += chunk;
         source_pos += chunk;
+        atomic_store_explicit(&stream->pending_time_samples, pending, memory_order_relaxed);
 
-        if (p->stream->pending_time_samples == MAX_STREAM_SAMPLES) {
-            publish_time_packet(p->stream, next_write);
+        if (pending == MAX_STREAM_SAMPLES) {
+            publish_time_packet(stream, next_write);
         }
     }
 
@@ -998,7 +1063,7 @@ static int32_t watch_add_f_init(CSOUND *csound, WATCH_ADD_SPECTRAL *p) {
         p->handle,
         WATCH_DOMAIN_SPECTRUM,
         WATCH_DOMAIN_SPECTROGRAM,
-        (uint32_t) p->h.insdshead->esr,
+        (float) p->h.insdshead->esr,
         &p->stream
     );
 }
@@ -1086,36 +1151,28 @@ static int32_t watch_ftable_deinit(CSOUND *csound, WATCH_FTABLE *p) {
         return OK;
     }
 
+    release_stream(csound, &p->stream);
+
     WATCH_MANAGER *manager = csound->QueryGlobalVariable(csound, REGISTRY_NAME);
     if (manager != NULL) {
         csound->LockMutex(manager->registry_mutex);
-        WATCH_GRAPH *graph_to_free = NULL;
-        for (uint32_t i = 0; i < manager->graph_capacity; i++) {
-            WATCH_GRAPH *graph = manager->graphs[i];
-            if (graph != NULL && graph->data_config.config.graph_id == graph_id) {
-                if (p->stream != NULL) {
-                    graph->destroy_requested = true;
-                } else {
-                    manager->graphs[i] = NULL;
-                    graph_to_free = graph;
-                    if (manager->graph_count > 0U) {
-                        manager->graph_count--;
-                    }
-                }
-                break;
-            }
+        WATCH_GRAPH *graph = find_graph(manager, graph_id);
+        if (graph != NULL) {
+            graph->destroy_requested = true;
         }
-
         csound->UnlockMutex(manager->registry_mutex);
-        free_graph(csound, graph_to_free);
     }
 
+    p->graph_id = INVALID_HANDLE;
     return OK;
 }
 
 static int32_t watch_ftable_title_deinit(CSOUND *csound, WATCH_FTABLE_TITLE *p) {
-    WATCH_FTABLE adapted = { .stream = p->stream, .graph_id = p->graph_id };
-    return watch_ftable_deinit(csound, &adapted);
+    WATCH_FTABLE adapted = { .h = p->h, .stream = p->stream, .graph_id = p->graph_id };
+    int32_t result = watch_ftable_deinit(csound, &adapted);
+    p->stream = adapted.stream;
+    p->graph_id = adapted.graph_id;
+    return result;
 }
 
 int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p) {
@@ -1171,7 +1228,7 @@ int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p) {
         &graph_handle,
         WATCH_DOMAIN_FTABLE,
         WATCH_DOMAIN_FTABLE,
-        (uint32_t) CS_ESR,
+        (float) CS_ESR,
         &p->stream
     );
 
@@ -1199,7 +1256,9 @@ int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p) {
 }
 
 static int32_t watch_ftable_title(CSOUND *csound, WATCH_FTABLE_TITLE *p) {
+    // h carries insdshead: the CS_ESR macro used by watch_ftable reads it
     WATCH_FTABLE adapted = {
+        .h = p->h,
         .ftable = p->ftable,
         .ymin = p->ymin,
         .ymax = p->ymax,
@@ -1277,31 +1336,33 @@ int32_t watch_add_k_init(CSOUND *csound, WATCH_ADD_TIME *p) {
         p->handle,
         WATCH_DOMAIN_CONTROL,
         WATCH_DOMAIN_CONTROL,
-        (uint32_t) p->h.insdshead->ekr,
+        (float) p->h.insdshead->ekr,
         &p->stream
     );
 }
 
 int32_t watch_add_k(CSOUND *csound, WATCH_ADD_TIME *p) {
+    (void) csound;
     WATCH_STREAM *stream = p->stream;
-    uint64_t sequence = p->h.insdshead->kcounter;
+    int64_t sequence = (int64_t) p->h.insdshead->kcounter;
 
     for (;;) {
-        unsigned write = atomic_load_explicit(&p->stream->write_pos, memory_order_relaxed);
+        unsigned write = atomic_load_explicit(&stream->write_pos, memory_order_relaxed);
         unsigned next_write = (write + 1U) % MAX_QUEUE_SIZE;
 
         WATCH_DATA_PACKET *packet = &stream->slots[write].time;
+        uint32_t pending = pending_time_samples(stream);
 
-        int64_t off_pend = stream->pending_time_sequence + (int64_t) stream->pending_time_samples;
-        if (stream->pending_time_samples > 0U && sequence != off_pend) {
+        int64_t off_pend = stream->pending_time_sequence + (int64_t) pending;
+        if (pending > 0U && sequence != off_pend) {
             publish_time_packet(stream, next_write);
             continue;
         }
 
-        if (stream->pending_time_samples == 0) {
-            unsigned read = atomic_load_explicit(&p->stream->read_pos, memory_order_acquire);
+        if (pending == 0U) {
+            unsigned read = atomic_load_explicit(&stream->read_pos, memory_order_acquire);
             if (next_write == read) {
-                atomic_fetch_add(&stream->dropped_samples, 1);
+                atomic_fetch_add_explicit(&stream->dropped_samples, 1, memory_order_relaxed);
                 return OK;
             }
 
@@ -1316,21 +1377,25 @@ int32_t watch_add_k(CSOUND *csound, WATCH_ADD_TIME *p) {
             stream->pending_time_sequence = sequence;
         }
 
-        packet->data.samples[stream->pending_time_samples++] = isfinite(*p->signal) ? (float) *p->signal : 0.0f;
-        if (stream->pending_time_samples == MAX_STREAM_SAMPLES) {
+        packet->data.samples[pending] = isfinite(*p->signal) ? (float) *p->signal : 0.0f;
+        pending++;
+        atomic_store_explicit(&stream->pending_time_samples, pending, memory_order_relaxed);
+
+        if (pending == MAX_STREAM_SAMPLES) {
             publish_time_packet(stream, next_write);
         }
 
         return OK;
     }
-
 }
 
 
 #define S(s) sizeof(s)
 
 static OENTRY localops[] = {
-    { "watchtable",           S(WATCH_FTABLE),             0, "",  "ioo",         (SUBR) watch_ftable,             NULL,                  (SUBR) watch_ftable_deinit,       NULL, 0 },
+    { "watchtable",           S(WATCH_FTABLE),             0, "",  "i",           (SUBR) watch_ftable,             NULL,                  (SUBR) watch_ftable_deinit,       NULL, 0 },
+    { "watchtable.m",         S(WATCH_FTABLE),             0, "",  "ii",          (SUBR) watch_ftable,             NULL,                  (SUBR) watch_ftable_deinit,       NULL, 0 },
+    { "watchtable.mm",        S(WATCH_FTABLE),             0, "",  "iii",         (SUBR) watch_ftable,             NULL,                  (SUBR) watch_ftable_deinit,       NULL, 0 },
     { "watchtable.s",         S(WATCH_FTABLE_TITLE),       0, "",  "iiiS",        (SUBR) watch_ftable_title,       NULL,                  (SUBR) watch_ftable_title_deinit, NULL, 0 },
     { "watchtable.t",         S(WATCH_FTABLE),             0, "",  "iiii",        (SUBR) watch_ftable,             NULL,                  (SUBR) watch_ftable_deinit,       NULL, 0 },
     { "watchtable.ts",        S(WATCH_FTABLE),             0, "",  "iiiiS",       (SUBR) watch_ftable,             NULL,                  (SUBR) watch_ftable_deinit,       NULL, 0 },
@@ -1355,9 +1420,9 @@ static OENTRY localops[] = {
     { "watchspectrogram.t",   S(WATCH_CREATE_SPECTROGRAM), 0, "i", "iiiiiioo",    (SUBR) watch_create_spectrogram, NULL,                  (SUBR) watch_deinit,              NULL, 0 },
     { "watchspectrogram.s",   S(WATCH_CREATE_SPECTROGRAM), 0, "i", "iiiiiiiiS",   (SUBR) watch_create_spectrogram, NULL,                  (SUBR) watch_deinit,              NULL, 0 },
 
-    { "watchadd.a",           S(WATCH_ADD_TIME),           0, "",  "ia",          (SUBR) watch_add_a_init,         (SUBR) watch_add_a,    NULL,                             NULL, 0 },
-    { "watchadd.k",           S(WATCH_ADD_TIME),           0, "",  "ik",          (SUBR) watch_add_k_init,         (SUBR) watch_add_k,    NULL,                             NULL, 0 },
-    { "watchadd.f",           S(WATCH_ADD_SPECTRAL),       0, "",  "if",          (SUBR) watch_add_f_init,         (SUBR) watch_add_f,    NULL,                             NULL, 0 },
+    { "watchadd.a",           S(WATCH_ADD_TIME),           0, "",  "ia",          (SUBR) watch_add_a_init,         (SUBR) watch_add_a,    (SUBR) watch_add_deinit,          NULL, 0 },
+    { "watchadd.k",           S(WATCH_ADD_TIME),           0, "",  "ik",          (SUBR) watch_add_k_init,         (SUBR) watch_add_k,    (SUBR) watch_add_deinit,          NULL, 0 },
+    { "watchadd.f",           S(WATCH_ADD_SPECTRAL),       0, "",  "if",          (SUBR) watch_add_f_init,         (SUBR) watch_add_f,    (SUBR) watch_add_f_deinit,        NULL, 0 },
 
     { "watchtheme",           S(WATCH_THEME),              0, "",  "ii",          (SUBR) watch_theme,              NULL,                  NULL,                             NULL, 0 }
 };

@@ -18,7 +18,15 @@ The opcode is selected automatically from the signal type:
 * an `f`-signal can be attached to `watchspectrum` or `watchspectrogram`.
 
 Several compatible signals can be attached to one graph. Each call creates a
-separate stream, up to 64 streams per graph.
+separate stream, up to 64 concurrent streams per graph.
+
+A stream belongs to the instrument instance that created it. When that instance
+ends, its residual packet is published and the stream slot is returned to the
+graph as soon as the sender has drained it, so a graph created once in the
+orchestra header can serve an unlimited number of notes over time. The graph
+itself stays alive until every stream attached to it has been released, so a
+`watchadd` still running after its graph creator has been deinitialized keeps
+working until its own note ends.
 
 ### Audio streams
 
@@ -35,8 +43,8 @@ audio streams belonging to the graph, preserving their phase relationship.
 One k-rate value is collected per control cycle. Values are accumulated into
 packets of 256 samples before they are published to the sender. A discontinuity
 publishes the partial packet before accumulation resumes at the new control
-timestamp. When the graph ends, its final residual packet is also published and
-the graph remains alive until the sender has drained its queue.
+timestamp. When the instance ends, its final residual packet is also published
+and the stream remains alive until the sender has drained its queue.
 
 This batching adds up to approximately `256 / kr` seconds of latency before a
 complete packet becomes available to the sender. Packets carry control-cycle

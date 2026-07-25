@@ -50,7 +50,8 @@ graph:i = watchspectrum(min_freq:i, max_freq:i, min_value:i, max_value:i, scale:
 * `scale:i`: spectral display scale: `0` for gain, `1` for power, or `2` for
   decibels.
 * `x_ticks:i` (optional): whole number of frequency axis/grid divisions, from
-  `0` through `256`. `0` selects the viewer default of 10.
+  `0` through `256`; a value outside that range is an init error. `0` selects
+  the viewer default of 10.
 * `y_ticks:i` (optional): whole number of value axis/grid divisions, from `0`
   through `256`. `0` selects the viewer default of 8.
 * `title:S` (optional): window title. The default title is

@@ -1,6 +1,6 @@
 <CsoundSynthesizer>
 <CsOptions>
--o dac2
+-o dac2 --run-unit-tests
 </CsOptions>
 <CsInstruments>
 sr = 44100
@@ -12,7 +12,8 @@ instr ScopeStream
     sig:a = diskin2("/Users/pm/AcaHub/AudioSamples/vox.wav", 1, 0, 1)
     scope:i = watchscope(0.5, 30, 30, -1, 1, "Scope receiver test")
     scope_sampled:i = watchscope(1.0, 30, 30, -1, 1, "Scope receiver sampled test")
-    ; assert_true(iscope != 0)
+    assert_true(scope != 0)
+    assert_true(scope_sampled != 0)
 
     signal1:a = oscili(0.9, 2)
     signal2:a = oscili(0.5, 5)

@@ -37,11 +37,13 @@ graph:i = watchscope(win_size:i [, x_ticks:i [, y_ticks:i [, ymin:i [, ymax:i [,
 
 * `win_size:i`: visible signal duration in seconds. Must be greater than zero.
 * `x_ticks:i` (optional): whole number of horizontal axis/grid divisions, from
-  `0` through `256`. It affects only the grid and tick labels, not the number of
-  samples. `0` selects the viewer default of 10.
+  `0` through `256`; a value outside that range is an init error. It affects
+  only the grid and tick labels, not the number of samples. `0` selects the
+  viewer default of 10.
 * `y_ticks:i` (optional): whole number of vertical axis/grid divisions, from
-  `0` through `256`. It affects only the grid and tick labels, not the number of
-  samples. `0` selects the viewer default of 8.
+  `0` through `256`; a value outside that range is an init error. It affects
+  only the grid and tick labels, not the number of samples. `0` selects the
+  viewer default of 8.
 * `ymin:i` (optional): lower amplitude limit. When supplied without `ymax`, the
   upper limit is `ymin + 2`.
 * `ymax:i` (optional): upper amplitude limit. It must be greater than `ymin`.
