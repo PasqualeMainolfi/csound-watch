@@ -1,9 +1,9 @@
 # Csound Watch
 
 Csound Watch is a Csound 7 plugin for real-time signal visualization. It
-provides simple opcodes for creating oscilloscope, spectrum, spectrogram, and
-static function-table windows while keeping all graphics work outside Csound's
-audio thread.
+provides simple opcodes for creating oscilloscope, control-signal, spectrum,
+spectrogram, and static function-table windows while keeping all graphics work
+outside Csound's audio thread.
 
 Graphs are created with an init-time opcode and signals are attached with
 `watchadd`:
@@ -26,26 +26,26 @@ one another. The standalone viewer is launched automatically when it is needed
 and normally terminates shortly after Csound stops.
 
 > [!NOTE]
-> Csound Watch currently targets the Csound 7 plugin API. k-rate plotting is
-> planned but is not part of the current opcode interface.
+> Csound Watch currently targets the Csound 7 plugin API.
 
 ## Features
 
 - Oscilloscope-style visualization of a-rate signals.
+- Time-domain visualization of k-rate control signals.
 - Power-spectrum visualization of non-sliding PVS `f`-signals.
 - Scrolling spectrograms from non-sliding PVS `f`-signals.
 - Complete, init-time plotting of function tables.
 - Gain, power, and decibel spectral display scales.
 - Several compatible streams in the same graph.
-- Shared sample timeline for synchronized oscilloscope streams.
+- Shared sample timeline for synchronized time-domain streams.
 - Resizable windows with automatically generated axis and tick labels.
 - Newly created graph windows are brought to the foreground.
-- Per-graph light and inverted dark themes.
+- Per-graph light and dark themes with high-contrast stream colors.
 - Automatic launch and shutdown of the standalone viewer.
 - Support for several simultaneous Csound processes through one viewer.
 - Portable local UDP transport for macOS, Linux, and Windows.
-- No rendering, socket I/O, waiting, or viewer allocation in the audio
-  performance callback.
+- No rendering, socket I/O, waiting, or viewer allocation in performance
+  callbacks.
 
 ## How it works
 
@@ -54,7 +54,7 @@ Csound and the viewer run as separate processes:
 ```text
 Csound audio thread
         |
-        | copies samples or spectral bins
+        | copies audio samples, control values, or spectral bins
         v
 bounded per-stream ring buffer
         |
@@ -66,10 +66,12 @@ UDP 127.0.0.1:48120
 standalone SDL3 viewer
 ```
 
-`watchadd` only copies incoming data into a bounded, preallocated queue. A
-dedicated sender thread removes packets from that queue and sends them to the
-viewer. If the queue is full, new visualization data may be dropped rather than
-blocking audio processing.
+`watchadd` only copies incoming data into a bounded, preallocated queue. Audio
+samples are packetized as they arrive. Control samples are accumulated into
+batches of up to 256 values; a final partial batch is published when the graph
+ends. A dedicated sender thread removes packets from the queue and sends them to
+the viewer. If the queue is full, new visualization data may be dropped rather
+than blocking Csound's performance thread.
 
 `watchtable` takes an init-time snapshot instead. The sender transfers that
 snapshot progressively after the graph configuration is acknowledged, without
@@ -77,9 +79,9 @@ placing the complete table in the streaming ring buffer. The viewer assembles
 chunks by offset and exposes the plot only after every table sample has arrived.
 
 The viewer validates and acknowledges each graph configuration before the
-sender starts streaming data for that graph. Audio packets are accumulated into
-the requested scope window, while spectral packets are reassembled into complete
-PVS frames.
+sender starts streaming data for that graph. Audio and control packets are
+accumulated into the requested time window, while spectral packets are
+reassembled into complete PVS frames.
 
 The transport is intended for responsive visualization, not lossless recording.
 
@@ -88,11 +90,12 @@ The transport is intended for responsive visualization, not lossless recording.
 | Opcode | Signal domain | Purpose |
 |---|---|---|
 | [`watchscope`](doc/watchscope.md) | Time | Create an oscilloscope graph |
+| [`watchcontrol`](doc/watchcontrol.md) | Time | Create a control-signal graph |
 | [`watchspectrum`](doc/watchspectrum.md) | Frequency | Create a power-spectrum graph |
 | [`watchspectrogram`](doc/watchspectrogram.md) | Time/frequency | Create a scrolling spectrogram |
 | [`watchtable`](doc/watchtable.md) | Table index | Plot a complete function table |
 | [`watchtheme`](doc/watchtheme.md) | Graph appearance | Select the light or dark theme |
-| [`watchadd`](doc/watchadd.md) | Time or frequency | Attach a compatible signal to a graph |
+| [`watchadd`](doc/watchadd.md) | Time or frequency | Attach an a-rate, k-rate, or `f`-signal to a graph |
 
 ### `watchscope`
 
@@ -121,6 +124,25 @@ default; explicit values may range from 1 through 256.
 Several a-rate signals may be attached to the same scope. Packets carry absolute
 sample positions, allowing the viewer to preserve their relative phase even
 with `ksmps = 1`, large control blocks, or variable packet arrival times.
+
+### `watchcontrol`
+
+```csound
+graph:i = watchcontrol(win_size:i [, x_ticks:i [, y_ticks:i]])
+graph:i = watchcontrol(win_size:i, x_ticks:i, y_ticks:i, ymin:i)
+graph:i = watchcontrol(win_size:i, x_ticks:i, y_ticks:i, ymin:i, ymax:i)
+graph:i = watchcontrol(win_size:i, x_ticks:i, y_ticks:i, ymin:i, ymax:i, title:S)
+```
+
+`watchcontrol` creates a time-domain graph for one or more k-rate signals.
+`win_size` is the visible duration in seconds, and the default value range is
+`-1` through `1`. The x-axis is labelled `Time (s)` and the y-axis `Value`.
+
+One value is collected per k-cycle. Values are accumulated into packets of 256
+samples before transmission; a discontinuity or graph shutdown publishes a
+shorter final packet. Consequently, packet batching adds up to approximately
+`256 / kr` seconds of latency before a new batch becomes available to the
+sender. Tick arguments affect only the grid and labels.
 
 ### `watchspectrum`
 
@@ -157,12 +179,14 @@ number of PVS frames retained in the spectrogram history.
 
 ```csound
 watchadd(graph:i, signal:a)
+watchadd(graph:i, signal:k)
 watchadd(graph:i, signal:f)
 ```
 
 The overload is selected from the signal type:
 
 - a-rate signals can be attached to `watchscope`;
+- k-rate signals can be attached to `watchcontrol`;
 - non-sliding `f`-signals can be attached to `watchspectrum` or
   `watchspectrogram`.
 
@@ -191,7 +215,10 @@ watchtheme graph:i, theme:i
 ```
 
 Set `theme` to `0` for the default light palette or `1` for the dark palette.
-The dark palette is the component-wise inversion of the light palette. Call
+Neutral graph components are inverted between themes. Signal curves use
+dedicated high-contrast palettes: darker colors on the light background and
+brighter colors on the dark background. Each of the 64 supported stream indices
+receives a distinct color while preserving its base hue between themes. Call
 `watchtheme` at init time after creating the graph.
 
 See the individual opcode pages in [`doc`](doc) for complete argument
@@ -218,7 +245,7 @@ currently linear.
 
 ## Complete example
 
-The following example creates all three graph types from one signal:
+The following example creates audio, control, spectrum, and spectrogram graphs:
 
 ```csound
 <CsoundSynthesizer>
@@ -234,6 +261,7 @@ nchnls = 2
 
 instr WatchSignals
     scope:i = watchscope(0.5, 10, 8, -1, 1, "Waveform")
+    control:i = watchcontrol(2, 10, 8, -1, 1, "Control signal")
     spectrum:i = watchspectrum(
         20, 12000,
         -120, 0,
@@ -247,9 +275,11 @@ instr WatchSignals
         "Spectrogram")
 
     signal:a = vco2(0.35, 220)
+    modulation:k = oscili(0.8, 1)
     analysis:f = pvsanal(signal, 2048, 256, 2048, 1)
 
     watchadd(scope, signal)
+    watchadd(control, modulation)
     watchadd(spectrum, analysis)
     watchadd(spectrogram, analysis)
 
@@ -266,6 +296,7 @@ i "WatchSignals" 0 20
 Additional ready-to-run files are available in [`examples`](examples):
 
 - [`watchscope.csd`](examples/watchscope.csd)
+- [`watchcontrol.csd`](examples/watchcontrol.csd)
 - [`watchspectrum.csd`](examples/watchspectrum.csd)
 - [`watchspectrogram.csd`](examples/watchspectrogram.csd)
 - [`watchtable.csd`](examples/watchtable.csd)
@@ -480,12 +511,12 @@ The executable is resolved in this order:
 3. the standard Risset asset directory;
 4. `watch_viewer` or `watch_viewer.exe` found through `PATH`.
 
-Every `watchscope`, `watchspectrum`, `watchspectrogram`, or `watchtable` call
-creates a new graph window. The viewer requests that each new window be raised
-and focused; the final decision remains subject to the desktop window manager's
-focus-stealing policy. Windows are assigned grid positions in the usable area
-of the display; positions are reused when there are more windows than available
-grid cells. Windows may be closed manually.
+Every `watchscope`, `watchcontrol`, `watchspectrum`, `watchspectrogram`, or
+`watchtable` call creates a new graph window. The viewer requests that each new
+window be raised and focused; the final decision remains subject to the desktop
+window manager's focus-stealing policy. Windows are assigned grid positions in
+the usable area of the display; positions are reused when there are more
+windows than available grid cells. Windows may be closed manually.
 
 When a Csound session ends, it sends a session-close message three times. The
 viewer closes only the windows belonging to that session. If no graphs remain,
@@ -505,12 +536,14 @@ viewer immediately.
 | Maximum open graphs in one viewer | 32 across all Csound sessions |
 | Maximum streams per graph | 64 |
 | Audio samples per packet | Up to 256 |
+| Control samples per packet | Up to 256 |
 | Spectral bins per packet | Up to 256 |
 | Function-table samples per packet | Up to 256 |
 | Maximum function-table size | 1,073,741,824 samples (`Csound MAXLEN`) |
 | Per-stream sender queue | 50 bounded slots |
 | Viewer refresh rate | 60 Hz |
 | Scope render latency | Approximately 50 ms |
+| Control batching latency | Up to approximately `256 / kr` seconds |
 | Default window size | 600 × 400 |
 | Minimum window size | 360 × 260 |
 | Default axis/grid divisions | 10 horizontal, 8 vertical |
@@ -518,9 +551,10 @@ viewer immediately.
 | Maximum title length | 383 bytes plus terminator |
 | Spectral dB floor | `-160 dB` |
 
-Large control blocks, FFT frames, and function tables are divided across
-multiple UDP packets. Function-table packets carry their sample offset and
-transfer size; the viewer displays the plot only after the transfer is complete.
+Large audio blocks, FFT frames, and function tables are divided across multiple
+UDP packets. Control values are accumulated into batches of 256 samples.
+Function-table packets carry their sample offset and transfer size; the viewer
+displays the plot only after the transfer is complete.
 
 The viewer validates packet magic, protocol version, type, payload length,
 graph/stream identifiers, sample rate, FFT metadata, ranges, and title
@@ -590,6 +624,7 @@ Watch is not designed as a signal recorder.
 
 - [Overview and architecture](doc/index.md)
 - [`watchscope`](doc/watchscope.md)
+- [`watchcontrol`](doc/watchcontrol.md)
 - [`watchspectrum`](doc/watchspectrum.md)
 - [`watchspectrogram`](doc/watchspectrogram.md)
 - [`watchtable`](doc/watchtable.md)
@@ -598,7 +633,6 @@ Watch is not designed as a signal recorder.
 
 ## Roadmap
 
-- k-rate/control-signal graphs;
 - further rendering and labeling refinements while keeping the interface simple.
 
 ## Dependencies and licenses

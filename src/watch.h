@@ -24,8 +24,7 @@
 #define WATCH_SESSION_CLOSE_REPETITIONS 3U
 
 
-// TODO: plot f-table (statically)
-// TODO: control graph
+// TODO: add signal label non-optional
 // CHECK: maybe min/max auto is a wrong idea cause min/max is local
 
 
@@ -185,6 +184,7 @@ typedef struct {
 
 // INTERFACE
 
+int32_t watch_create_control(CSOUND *csound, WATCH_CREATE_TIME *p); // i-time
 int32_t watch_create_scope(CSOUND *csound, WATCH_CREATE_TIME *p); // i-time
 int32_t watch_create_spectrum(CSOUND *csound, WATCH_CREATE_SPECTRAL *p); // i-time
 int32_t watch_create_spectrogram(CSOUND *csound, WATCH_CREATE_SPECTROGRAM *p); // i-time
@@ -193,8 +193,8 @@ int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p); // i-time
 int32_t watch_theme(CSOUND *csound, WATCH_THEME *p); // i-time
 
 int32_t watch_add_a(CSOUND *csound, WATCH_ADD_TIME *p); // k-time
+int32_t watch_add_k(CSOUND *csound, WATCH_ADD_TIME *p); // k-time
 int32_t watch_add_f(CSOUND *csound, WATCH_ADD_SPECTRAL *p); // k-time
-
 
 
 #endif

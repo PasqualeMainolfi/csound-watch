@@ -4,6 +4,7 @@
   "opcodes": [
     "watchtable",
     "watchscope",
+    "watchcontrol",
     "watchspectrum",
     "watchspectrogram",
     "watchadd",

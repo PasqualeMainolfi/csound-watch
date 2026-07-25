@@ -9,23 +9,23 @@ declared with an init-time opcode and populated with one or more signals through
 The current implementation provides:
 
 * oscilloscope-style plots for a-rate signals;
+* time-domain plots for k-rate control signals;
 * power spectra from non-sliding `f`-signals;
-* spectrograms from non-sliding `f`-signals.
-* static plots of complete function tables.
+* spectrograms from non-sliding `f`-signals;
+* static plots of complete function tables;
 * selectable light and dark graph themes.
-
-k-rate plotting is planned, but is not part of the current opcode interface.
 
 ## Architecture
 
 Plotting is performed by a standalone SDL3 viewer rather than by Csound's audio
 thread.
 
-During performance, `watchadd` copies samples or spectral bins into a bounded,
-preallocated ring buffer. A dedicated sender thread reads that buffer and sends
-small binary packets over UDP to `127.0.0.1:48120`. The viewer receives the
-packets, reconstructs each signal window or spectral frame, and renders it in a
-separate process.
+During performance, `watchadd` copies audio samples, control values, or spectral
+bins into a bounded, preallocated ring buffer. Control values are accumulated
+into 256-sample packets, with the final residual packet published when the graph
+ends. A dedicated sender thread reads the buffer and sends small binary packets
+over UDP to `127.0.0.1:48120`. The viewer receives the packets, reconstructs
+each signal window or spectral frame, and renders it in a separate process.
 
 The performance opcode does not perform socket I/O, allocate viewer memory, or
 wait for rendering. If a ring buffer fills, new data can be dropped instead of
@@ -73,11 +73,12 @@ exiting. A new graph arriving during that interval cancels the shutdown.
 | Opcode | Purpose |
 |---|---|
 | [`watchscope`](watchscope.md) | Create a time-domain oscilloscope graph |
+| [`watchcontrol`](watchcontrol.md) | Create a k-rate control-signal graph |
 | [`watchspectrum`](watchspectrum.md) | Create a power-spectrum graph |
 | [`watchspectrogram`](watchspectrogram.md) | Create a scrolling spectrogram |
 | [`watchtable`](watchtable.md) | Plot a complete function table |
 | [`watchtheme`](watchtheme.md) | Select a graph's light or dark theme |
-| [`watchadd`](watchadd.md) | Attach an a-rate or `f`-signal to a graph |
+| [`watchadd`](watchadd.md) | Attach an a-rate, k-rate, or `f`-signal to a graph |
 
 ## Common behavior and limits
 

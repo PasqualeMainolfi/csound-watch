@@ -33,7 +33,7 @@
 #define VIEWER_SHUTDOWN_DELAY_MS 500U
 #define SCOPE_RENDER_LATENCY_MS 50U
 #define RENDER_SUPERSAMPLE_SCALE 2
-#define WAVEFORM_COLOR 0
+#define WAVEFORM_LINE_RADIUS 1.5f
 #define SPECTRAL_DB_FLOOR -160.0f
 #define MAX_SPECTRAL_TOTAL_BINS 1048576U
 #define MAX_SPECTROGRAM_TEXELS 16777216ULL
@@ -184,13 +184,12 @@ typedef struct {
     bool scope_display_started;
 } VIEW_GRAPH;
 
-static uint8_t themed_component(
-    WATCH_GRAPH_THEME theme,
-    uint8_t light_component
-) {
-    return theme == WATCH_THEME_DARK
-        ? (uint8_t) (255U - light_component)
-        : light_component;
+static SDL_Color stream_colors_light[MAX_STREAMS];
+static SDL_Color stream_colors_dark[MAX_STREAMS];
+static bool stream_colors_ready = false;
+
+static uint8_t themed_component(WATCH_GRAPH_THEME theme, uint8_t light_component) {
+    return theme == WATCH_THEME_DARK ? (uint8_t) (255U - light_component) : light_component;
 }
 
 static void set_themed_draw_color(
@@ -200,12 +199,118 @@ static void set_themed_draw_color(
     uint8_t alpha
 ) {
     uint8_t component = themed_component(theme, light_component);
+    SDL_SetRenderDrawColor(renderer, component, component, component, alpha);
+}
+
+static SDL_FColor hsv_color(float hue, float saturation, float value) {
+    float sector = hue / 60.0f;
+    float chroma = value * saturation;
+    float x = chroma * (1.0f - fabsf(fmodf(sector, 2.0f) - 1.0f));
+    float red = 0.0f;
+    float green = 0.0f;
+    float blue = 0.0f;
+
+    if (sector < 1.0f) {
+        red = chroma;
+        green = x;
+    } else if (sector < 2.0f) {
+        red = x;
+        green = chroma;
+    } else if (sector < 3.0f) {
+        green = chroma;
+        blue = x;
+    } else if (sector < 4.0f) {
+        green = x;
+        blue = chroma;
+    } else if (sector < 5.0f) {
+        red = x;
+        blue = chroma;
+    } else {
+        red = chroma;
+        blue = x;
+    }
+
+    float minimum = value - chroma;
+    SDL_FColor color = {
+        .r = red + minimum,
+        .g = green + minimum,
+        .b = blue + minimum,
+        .a = 1.0f
+    };
+    return color;
+}
+
+static float linear_color_component(float component) {
+    return component <= 0.04045f
+        ? component / 12.92f
+        : powf((component + 0.055f) / 1.055f, 2.4f);
+}
+
+static float color_luminance(SDL_FColor color) {
+    return
+        0.2126f * linear_color_component(color.r)
+        + 0.7152f * linear_color_component(color.g)
+        + 0.0722f * linear_color_component(color.b);
+}
+
+static SDL_Color byte_color(SDL_FColor color) {
+    SDL_Color result = {
+        .r = (uint8_t) lrintf(fminf(fmaxf(color.r, 0.0f), 1.0f) * 255.0f),
+        .g = (uint8_t) lrintf(fminf(fmaxf(color.g, 0.0f), 1.0f) * 255.0f),
+        .b = (uint8_t) lrintf(fminf(fmaxf(color.b, 0.0f), 1.0f) * 255.0f),
+        .a = 255U
+    };
+    return result;
+}
+
+static void initialize_stream_colors(void) {
+    if (stream_colors_ready) {
+        return;
+    }
+
+    for (uint32_t i = 0U; i < MAX_STREAMS; i++) {
+        float hue = fmodf(
+            210.0f + (float) i * 137.507764f,
+            360.0f);
+        float saturation = 0.68f + 0.08f * (float) (i % 4U);
+        float value = 0.86f + 0.04f * (float) ((i / 4U) % 3U);
+        SDL_FColor light = hsv_color(hue, saturation, value);
+        SDL_FColor dark = light;
+
+        while (color_luminance(light) > 0.155f) {
+            light.r *= 0.94f;
+            light.g *= 0.94f;
+            light.b *= 0.94f;
+        }
+        while (color_luminance(dark) < 0.30f) {
+            dark.r += (1.0f - dark.r) * 0.08f;
+            dark.g += (1.0f - dark.g) * 0.08f;
+            dark.b += (1.0f - dark.b) * 0.08f;
+        }
+
+        stream_colors_light[i] = byte_color(light);
+        stream_colors_dark[i] = byte_color(dark);
+    }
+    stream_colors_ready = true;
+}
+
+static void set_stream_draw_color(
+    SDL_Renderer *renderer,
+    WATCH_GRAPH_THEME theme,
+    uint32_t stream_index
+) {
+    initialize_stream_colors();
+    const SDL_Color *palette =
+        theme == WATCH_THEME_DARK
+            ? stream_colors_dark
+            : stream_colors_light;
+    SDL_Color color = palette[stream_index % MAX_STREAMS];
     SDL_SetRenderDrawColor(
         renderer,
-        component,
-        component,
-        component,
-        alpha);
+        color.r,
+        color.g,
+        color.b,
+        color.a);
 }
 
 static float graph_pixel_density(const VIEW_GRAPH *graph);
@@ -971,10 +1076,26 @@ static void draw_waveform_line(
     float y2,
     bool supersampled
 ) {
+    float radius = supersampled ? WAVEFORM_LINE_RADIUS : 1.0f;
     SDL_RenderLine(renderer, x1, y1, x2, y2);
-    if (supersampled) {
-        SDL_RenderLine(renderer, x1 + 0.5f, y1, x2 + 0.5f, y2);
-    }
+    SDL_RenderLine(renderer, x1 - radius, y1, x2 - radius, y2);
+    SDL_RenderLine(renderer, x1 + radius, y1, x2 + radius, y2);
+    SDL_RenderLine(renderer, x1, y1 - radius, x2, y2 - radius);
+    SDL_RenderLine(renderer, x1, y1 + radius, x2, y2 + radius);
+}
+
+static void draw_waveform_point(
+    SDL_Renderer *renderer,
+    float x,
+    float y,
+    bool supersampled
+) {
+    float radius = supersampled ? WAVEFORM_LINE_RADIUS : 1.0f;
+    SDL_RenderPoint(renderer, x, y);
+    SDL_RenderPoint(renderer, x - radius, y);
+    SDL_RenderPoint(renderer, x + radius, y);
+    SDL_RenderPoint(renderer, x, y - radius);
+    SDL_RenderPoint(renderer, x, y + radius);
 }
 
 static void draw_scope_vertical(SDL_Renderer *renderer, float x, float top, float bottom, bool supersampled) {
@@ -982,28 +1103,32 @@ static void draw_scope_vertical(SDL_Renderer *renderer, float x, float top, floa
 }
 
 static void draw_scope_polyline(SDL_Renderer *renderer, SDL_FPoint *points, uint32_t point_count, bool supersampled) {
+    float radius = supersampled ? WAVEFORM_LINE_RADIUS : 1.0f;
     SDL_RenderLines(renderer, points, (int) point_count);
-    if (!supersampled) {
-        return;
-    }
 
     for (uint32_t i = 0; i < point_count; i++) {
-        points[i].x += 0.5f;
+        points[i].x -= radius;
     }
     SDL_RenderLines(renderer, points, (int) point_count);
 
     for (uint32_t i = 0; i < point_count; i++) {
-        points[i].y += 0.5f;
+        points[i].x += 2.0f * radius;
     }
     SDL_RenderLines(renderer, points, (int) point_count);
 
     for (uint32_t i = 0; i < point_count; i++) {
-        points[i].x -= 0.5f;
+        points[i].x -= radius;
+        points[i].y -= radius;
     }
     SDL_RenderLines(renderer, points, (int) point_count);
 
     for (uint32_t i = 0; i < point_count; i++) {
-        points[i].y -= 0.5f;
+        points[i].y += 2.0f * radius;
+    }
+    SDL_RenderLines(renderer, points, (int) point_count);
+
+    for (uint32_t i = 0; i < point_count; i++) {
+        points[i].y -= radius;
     }
 }
 
@@ -1016,10 +1141,9 @@ static uint32_t scope_buffer_index(const STREAM_TIME_BUFFER *stream, int64_t seq
 static float scope_display_sample(
     const STREAM_TIME_BUFFER *stream,
     uint32_t first_buffer_index,
-    uint32_t point_count,
     uint32_t display_index
 ) {
-    uint32_t source_offset = point_count - 1U - display_index;
+    uint32_t source_offset = display_index;
     return stream->buffer[
         (first_buffer_index + source_offset) % stream->capacity
     ];
@@ -1027,6 +1151,7 @@ static float scope_display_sample(
 
 static bool advance_scope_timeline(VIEW_GRAPH *graph, uint64_t now_ns) {
     double latest_safe_sample = 0.0;
+    double latest_received_sample = 0.0;
     double minimum_full_window_end = 0.0;
     uint32_t timeline_sample_rate = 0U;
     bool found_stream = false;
@@ -1042,6 +1167,10 @@ static bool advance_scope_timeline(VIEW_GRAPH *graph, uint64_t now_ns) {
         double stream_latest = (double) stream->next_sequence - (double) latency_samples;
         if (!found_stream || stream_latest < latest_safe_sample) {
             latest_safe_sample = stream_latest;
+        }
+        if (!found_stream
+            || (double) stream->next_sequence < latest_received_sample) {
+            latest_received_sample = (double) stream->next_sequence;
         }
         if (!found_stream) {
             timeline_sample_rate = stream->sample_rate;
@@ -1087,8 +1216,8 @@ static bool advance_scope_timeline(VIEW_GRAPH *graph, uint64_t now_ns) {
         && graph->scope_display_end_sample < minimum_full_window_end) {
         graph->scope_display_end_sample = minimum_full_window_end;
     }
-    if (graph->scope_display_end_sample > latest_safe_sample) {
-        graph->scope_display_end_sample = latest_safe_sample;
+    if (graph->scope_display_end_sample > latest_received_sample) {
+        graph->scope_display_end_sample = latest_received_sample;
     }
     return true;
 }
@@ -1097,6 +1226,7 @@ static void draw_scope_stream(
     SDL_Renderer *renderer,
     PLOT_AREA *p,
     STREAM_TIME_BUFFER *stream,
+    uint32_t stream_index,
     double graph_display_end_sample,
     bool supersampled,
     WATCH_GRAPH_THEME theme
@@ -1129,11 +1259,7 @@ static void draw_scope_stream(
     float first_x = p->left;
     float last_x = first_x + (float) (point_count - 1U) * x_step;
 
-    set_themed_draw_color(
-        renderer,
-        theme,
-        WAVEFORM_COLOR,
-        255U);
+    set_stream_draw_color(renderer, theme, stream_index);
 
     /*
      * When several samples fall inside one output pixel, drawing the raw
@@ -1158,14 +1284,12 @@ static void draw_scope_stream(
             float minimum = scope_display_sample(
                 stream,
                 first_buffer_index,
-                point_count,
                 first_in_column);
             float maximum = minimum;
             for (uint32_t i = first_in_column + 1U; i < end_in_column; i++) {
                 float sample = scope_display_sample(
                     stream,
                     first_buffer_index,
-                    point_count,
                     i);
                 if (sample < minimum) {
                     minimum = sample;
@@ -1187,7 +1311,6 @@ static void draw_scope_stream(
                 scope_display_sample(
                     stream,
                     first_buffer_index,
-                    point_count,
                     first_in_column));
             if (has_previous) {
                 draw_waveform_line(
@@ -1206,7 +1329,6 @@ static void draw_scope_stream(
                 scope_display_sample(
                     stream,
                     first_buffer_index,
-                    point_count,
                     end_in_column - 1U));
             has_previous = true;
         }
@@ -1217,14 +1339,17 @@ static void draw_scope_stream(
         float sample = scope_display_sample(
             stream,
             first_buffer_index,
-            point_count,
             i);
         stream->plot_points[i].x = first_x + i * x_step;
         stream->plot_points[i].y = scope_sample_y(p, stream, sample);
     }
 
     if (point_count == 1U) {
-        SDL_RenderPoint(renderer, stream->plot_points[0].x, stream->plot_points[0].y);
+        draw_waveform_point(
+            renderer,
+            stream->plot_points[0].x,
+            stream->plot_points[0].y,
+            supersampled);
     } else {
         draw_scope_polyline(renderer, stream->plot_points, point_count, supersampled);
     }
@@ -2405,17 +2530,16 @@ static void render_spectrum(
 
     SDL_Rect clip = get_plot_clip_rect(plot);
     SDL_SetRenderClipRect(graph->renderer, &clip);
-    set_themed_draw_color(
-        graph->renderer,
-        graph->config.theme,
-        WAVEFORM_COLOR,
-        255U);
 
     for (uint32_t stream_index = 0; stream_index < MAX_STREAMS; stream_index++) {
         STREAM_SPECTRAL_BUFFER *stream = &graph->spectral_streams[stream_index];
         if (!stream->display_ready || stream->display_bins == NULL || stream->plot_points == NULL) {
             continue;
         }
+        set_stream_draw_color(
+            graph->renderer,
+            graph->config.theme,
+            stream_index);
 
         uint32_t first_bin;
         uint32_t last_bin;
@@ -2437,7 +2561,11 @@ static void render_spectrum(
         }
 
         if (point_count == 1U) {
-            SDL_RenderPoint(graph->renderer, stream->plot_points[0].x, stream->plot_points[0].y);
+            draw_waveform_point(
+                graph->renderer,
+                stream->plot_points[0].x,
+                stream->plot_points[0].y,
+                supersampled);
         } else {
             draw_scope_polyline(graph->renderer, stream->plot_points, point_count, supersampled);
         }
@@ -2573,11 +2701,6 @@ static void render_ftable(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled)
 
     SDL_Rect clip = get_plot_clip_rect(plot);
     SDL_SetRenderClipRect(graph->renderer, &clip);
-    set_themed_draw_color(
-        graph->renderer,
-        graph->config.theme,
-        WAVEFORM_COLOR,
-        255U);
 
     float raster_width = plot->right - plot->left;
     uint32_t column_count = raster_width >= 0.0f
@@ -2592,6 +2715,10 @@ static void render_ftable(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled)
         if (!stream->display_ready || stream->samples == NULL || stream->total_samples == 0U) {
             continue;
         }
+        set_stream_draw_color(
+            graph->renderer,
+            graph->config.theme,
+            stream_index);
 
         if (column_count > 0U
             && (uint64_t) stream->total_samples > (uint64_t) column_count * 2U) {
@@ -2657,7 +2784,11 @@ static void render_ftable(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled)
 
         if (stream->total_samples == 1U) {
             float f = ftable_sample_y(plot, stream->samples[0], ymin, ymax);
-            SDL_RenderPoint(graph->renderer, plot->left, f);
+            draw_waveform_point(
+                graph->renderer,
+                plot->left,
+                f,
+                supersampled);
             continue;
         }
 
@@ -2670,7 +2801,13 @@ static void render_ftable(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled)
             float x = plot->left + (float) i * x_step;
             float y =
                 ftable_sample_y(plot, stream->samples[i], ymin, ymax);
-            SDL_RenderLine(graph->renderer, previous_x, previous_y, x, y);
+            draw_waveform_line(
+                graph->renderer,
+                previous_x,
+                previous_y,
+                x,
+                y,
+                supersampled);
             previous_x = x;
             previous_y = y;
         }
@@ -2761,6 +2898,7 @@ static void render_graph(VIEW_GRAPH *graph) {
                     graph->renderer,
                     &plot,
                     &graph->scope_streams[i],
+                    i,
                     graph->scope_display_end_sample,
                     supersampled,
                     graph->config.theme);

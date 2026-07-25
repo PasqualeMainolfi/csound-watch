@@ -103,6 +103,7 @@ i "Scope" 0 20
 ## See also
 
 * [`watchadd`](watchadd.md)
+* [`watchcontrol`](watchcontrol.md)
 * [`watchspectrum`](watchspectrum.md)
 * [`watchspectrogram`](watchspectrogram.md)
 * [watch overview](index.md)

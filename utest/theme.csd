@@ -19,9 +19,13 @@ instr ThemeGraphs
     watchtheme(light, 0)
     watchtheme(dark, 1)
 
-    signal:a = oscili(0.8, 220)
-    watchadd(light, signal)
-    watchadd(dark, signal)
+    first:a = oscili(0.8, 220)
+    second:a = oscili(0.5, 330)
+
+    watchadd(light, first)
+    watchadd(light, second)
+    watchadd(dark, first)
+    watchadd(dark, second)
 endin
 </CsInstruments>
 <CsScore>

@@ -27,6 +27,8 @@ _Static_assert(
     "session-close packet header must be contiguous with its payload"
 );
 
+static void publish_time_packet(WATCH_STREAM *stream, unsigned next_write);
+
 
 static void try_launch_viewer(WATCH_MANAGER *manager, uint64_t now_ms) {
     if (manager->viewer_probe_started_ms == UINT64_MAX) {
@@ -270,14 +272,23 @@ static void send_ftable_packets(WATCH_MANAGER *manager, WATCH_STREAM *stream) {
     }
 }
 
-static bool ftable_graph_transfer_complete(const WATCH_GRAPH *graph) {
+static bool graph_transfer_complete(const WATCH_GRAPH *graph) {
     if (graph->stream_count == 0U) {
         return true;
     }
     for (uint32_t i = 0U; i < graph->stream_count; i++) {
         const WATCH_STREAM *stream = graph->streams[i];
-        if (stream != NULL
-            && stream->ftable_next_sample < stream->ftable_total_samples) {
+        if (stream == NULL) {
+            continue;
+        }
+
+        unsigned read =
+            atomic_load_explicit(&stream->read_pos, memory_order_relaxed);
+        unsigned write =
+            atomic_load_explicit(&stream->write_pos, memory_order_acquire);
+        if (read != write
+            || stream->pending_time_samples > 0U
+            || stream->ftable_next_sample < stream->ftable_total_samples) {
             return false;
         }
     }
@@ -326,7 +337,7 @@ static uintptr_t sender_thread_main(void *user_data) {
             }
 
             if (graph->destroy_requested
-                && ftable_graph_transfer_complete(graph)) {
+                && graph_transfer_complete(graph)) {
                 manager->graphs[i] = NULL;
                 if (manager->graph_count > 0U) {
                     manager->graph_count--;
@@ -656,27 +667,55 @@ static int32_t watch_deinit(CSOUND *csound, WATCH_CREATE_TIME *p) {
     WATCH_MANAGER *manager = csound->QueryGlobalVariable(csound, REGISTRY_NAME);
     if (manager != NULL) {
         csound->LockMutex(manager->registry_mutex);
-        WATCH_GRAPH *graph_to_free = NULL;
         for (uint32_t i = 0; i < manager->graph_capacity; i++) {
             WATCH_GRAPH *graph = manager->graphs[i];
             if (graph != NULL && graph->data_config.config.graph_id == graph_id) {
-                manager->graphs[i] = NULL;
-                graph_to_free = graph;
-                if (manager->graph_count > 0) {
-                    manager->graph_count--;
+                for (uint32_t stream_index = 0U; stream_index < graph->stream_count; stream_index++) {
+                    WATCH_STREAM *stream = graph->streams[stream_index];
+
+                    if (stream == NULL || stream->pending_time_samples == 0U) {
+                        continue;
+                    }
+
+                    unsigned write = atomic_load_explicit(&stream->write_pos, memory_order_relaxed);
+                    unsigned next_write = (write + 1U) % MAX_QUEUE_SIZE;
+                    publish_time_packet(stream, next_write);
                 }
+                graph->destroy_requested = true;
                 break;
             }
         }
 
         csound->UnlockMutex(manager->registry_mutex);
-        free_graph(csound, graph_to_free);
     }
 
     *p->handle = INVALID_HANDLE;
     return OK;
 }
 
+static int32_t create_time_helper(CSOUND *csound, WATCH_CREATE_TIME *p, WATCH_MSG_TIME_CONFIG *config) {
+    uint32_t nxticks;
+    uint32_t nyticks;
+    int32_t result = tick_count(csound, p->nxticks, "nxticks", &nxticks);
+    if (result != OK) {
+        return result;
+    }
+
+    result = tick_count(csound, p->nyticks, "nyticks", &nyticks);
+    if (result != OK) {
+        return result;
+    }
+
+    config->win_size = (float) *p->win_size;
+    config->nxticks = nxticks;
+    config->nyticks = nyticks;
+    result = numeric_range(csound, p->ymin, p->ymax, "y range", -FLT_MAX, FLT_MAX, &config->yrange);
+    if (result != OK) {
+        return result;
+    }
+
+    return OK;
+}
 
 int32_t watch_create_scope(CSOUND *csound, WATCH_CREATE_TIME *p) {
     *p->handle = (MYFLT) INVALID_HANDLE;
@@ -685,23 +724,10 @@ int32_t watch_create_scope(CSOUND *csound, WATCH_CREATE_TIME *p) {
         return csound->InitError(csound, "[watch] window size must be greater than zero");
     }
 
-    uint32_t nxticks;
-    uint32_t nyticks;
-    int32_t result = tick_count(csound, p->nxticks, "nxticks", &nxticks);
-    if (result != OK) {
-        return result;
-    }
-    result = tick_count(csound, p->nyticks, "nyticks", &nyticks);
-    if (result != OK) {
-        return result;
-    }
-
     WATCH_MSG_GRAPH_SETTINGS settings = {0};
     WATCH_MSG_TIME_CONFIG *config = &settings.time;
-    config->win_size = (float) *p->win_size;
-    config->nxticks = nxticks;
-    config->nyticks = nyticks;
-    result = numeric_range(csound, p->ymin, p->ymax, "y range", -FLT_MAX, FLT_MAX, &config->yrange);
+
+    int32_t result = create_time_helper(csound, p, config);
     if (result != OK) {
         return result;
     }
@@ -869,21 +895,16 @@ int32_t watch_add_a_init(CSOUND *csound, WATCH_ADD_TIME *p) {
         csound,
         p->handle,
         WATCH_DOMAIN_OSCILLOSCOPE,
-        WATCH_DOMAIN_CONTROL,
+        WATCH_DOMAIN_OSCILLOSCOPE,
         (uint32_t) p->h.insdshead->esr,
         &p->stream
     );
 }
 
 static void publish_time_packet(WATCH_STREAM *stream, unsigned next_write) {
-    WATCH_DATA_PACKET *packet = &stream->slots[
-        atomic_load_explicit(&stream->write_pos, memory_order_relaxed)
-    ].time;
-
+    WATCH_DATA_PACKET *packet = &stream->slots[atomic_load_explicit(&stream->write_pos, memory_order_relaxed)].time;
     packet->data.sample_count = stream->pending_time_samples;
-    packet->header.payload_size =
-        (uint32_t) offsetof(WATCH_MSG_DATA, samples)
-        + stream->pending_time_samples * (uint32_t) sizeof(float);
+    packet->header.payload_size = (uint32_t) offsetof(WATCH_MSG_DATA, samples) + stream->pending_time_samples * (uint32_t) sizeof(float);
     stream->pending_time_samples = 0U;
     atomic_store_explicit(&stream->write_pos, next_write, memory_order_release);
 }
@@ -1092,14 +1113,8 @@ static int32_t watch_ftable_deinit(CSOUND *csound, WATCH_FTABLE *p) {
     return OK;
 }
 
-static int32_t watch_ftable_title_deinit(
-    CSOUND *csound,
-    WATCH_FTABLE_TITLE *p
-) {
-    WATCH_FTABLE adapted = {
-        .stream = p->stream,
-        .graph_id = p->graph_id
-    };
+static int32_t watch_ftable_title_deinit(CSOUND *csound, WATCH_FTABLE_TITLE *p) {
+    WATCH_FTABLE adapted = { .stream = p->stream, .graph_id = p->graph_id };
     return watch_ftable_deinit(csound, &adapted);
 }
 
@@ -1231,14 +1246,84 @@ int32_t watch_theme(CSOUND *csound, WATCH_THEME *p) {
     }
 
     graph->data_config.config.theme = theme;
-    graph->data_config.header.sequence =
-        graph->data_config.header.sequence == INT64_MAX
-            ? 0
-            : graph->data_config.header.sequence + 1;
+    graph->data_config.header.sequence = graph->data_config.header.sequence == INT64_MAX ? 0 : graph->data_config.header.sequence + 1;
     graph->is_config_acked = false;
     graph->last_config_send_time = UINT64_MAX;
     csound->UnlockMutex(manager->registry_mutex);
     return OK;
+}
+
+int32_t watch_create_control(CSOUND *csound, WATCH_CREATE_TIME *p) {
+    *p->handle = (MYFLT) INVALID_HANDLE;
+
+    if (p->win_size == NULL || !isfinite((double) *p->win_size) || *p->win_size <= FL(0.0)) {
+        return csound->InitError(csound, "[watch] window size must be greater than zero");
+    }
+
+    WATCH_MSG_GRAPH_SETTINGS settings = {0};
+    WATCH_MSG_TIME_CONFIG *config = &settings.time;
+
+    int result = create_time_helper(csound, p, config);
+    if (result != OK) {
+        return result;
+    }
+
+    return create_graph(csound, p->handle, WATCH_DOMAIN_CONTROL, &settings, p->title, WATCH_THEME_LIGHT);
+}
+
+int32_t watch_add_k_init(CSOUND *csound, WATCH_ADD_TIME *p) {
+    return create_stream(
+        csound,
+        p->handle,
+        WATCH_DOMAIN_CONTROL,
+        WATCH_DOMAIN_CONTROL,
+        (uint32_t) p->h.insdshead->ekr,
+        &p->stream
+    );
+}
+
+int32_t watch_add_k(CSOUND *csound, WATCH_ADD_TIME *p) {
+    WATCH_STREAM *stream = p->stream;
+    uint64_t sequence = p->h.insdshead->kcounter;
+
+    for (;;) {
+        unsigned write = atomic_load_explicit(&p->stream->write_pos, memory_order_relaxed);
+        unsigned next_write = (write + 1U) % MAX_QUEUE_SIZE;
+
+        WATCH_DATA_PACKET *packet = &stream->slots[write].time;
+
+        int64_t off_pend = stream->pending_time_sequence + (int64_t) stream->pending_time_samples;
+        if (stream->pending_time_samples > 0U && sequence != off_pend) {
+            publish_time_packet(stream, next_write);
+            continue;
+        }
+
+        if (stream->pending_time_samples == 0) {
+            unsigned read = atomic_load_explicit(&p->stream->read_pos, memory_order_acquire);
+            if (next_write == read) {
+                atomic_fetch_add(&stream->dropped_samples, 1);
+                return OK;
+            }
+
+            packet->header.magic = WATCH_MAGIC;
+            packet->header.type = DATA;
+            packet->header.version = PROT_VERSION;
+            packet->header.sequence = sequence;
+
+            packet->data.graph_id = stream->graph_id;
+            packet->data.stream_id = stream->stream_id;
+            packet->data.sample_rate = stream->sample_rate;
+            stream->pending_time_sequence = sequence;
+        }
+
+        packet->data.samples[stream->pending_time_samples++] = isfinite(*p->signal) ? (float) *p->signal : 0.0f;
+        if (stream->pending_time_samples == MAX_STREAM_SAMPLES) {
+            publish_time_packet(stream, next_write);
+        }
+
+        return OK;
+    }
+
 }
 
 
@@ -1255,6 +1340,11 @@ static OENTRY localops[] = {
     { "watchscope.mm",        S(WATCH_CREATE_TIME),        0, "i", "iiiii",       (SUBR) watch_create_scope,       NULL,                  (SUBR) watch_deinit,              NULL, 0 },
     { "watchscope.s",         S(WATCH_CREATE_TIME),        0, "i", "iiiiiS",      (SUBR) watch_create_scope,       NULL,                  (SUBR) watch_deinit,              NULL, 0 },
 
+    { "watchcontrol",         S(WATCH_CREATE_TIME),        0, "i", "ioo",         (SUBR) watch_create_control,     NULL,                  (SUBR) watch_deinit,              NULL, 0 },
+    { "watchcontrol.m",       S(WATCH_CREATE_TIME),        0, "i", "iiii",        (SUBR) watch_create_control,     NULL,                  (SUBR) watch_deinit,              NULL, 0 },
+    { "watchcontrol.mm",      S(WATCH_CREATE_TIME),        0, "i", "iiiii",       (SUBR) watch_create_control,     NULL,                  (SUBR) watch_deinit,              NULL, 0 },
+    { "watchcontrol.s",       S(WATCH_CREATE_TIME),        0, "i", "iiiiiS",      (SUBR) watch_create_control,     NULL,                  (SUBR) watch_deinit,              NULL, 0 },
+
     { "watchspectrum",        S(WATCH_CREATE_SPECTRAL),    0, "i", "",            (SUBR) watch_create_spectrum,    NULL,                  (SUBR) watch_deinit,              NULL, 0 },
     { "watchspectrum.r",      S(WATCH_CREATE_SPECTRAL),    0, "i", "iiii",        (SUBR) watch_create_spectrum,    NULL,                  (SUBR) watch_deinit,              NULL, 0 },
     { "watchspectrum.t",      S(WATCH_CREATE_SPECTRAL),    0, "i", "iiiiioo",     (SUBR) watch_create_spectrum,    NULL,                  (SUBR) watch_deinit,              NULL, 0 },
@@ -1266,6 +1356,7 @@ static OENTRY localops[] = {
     { "watchspectrogram.s",   S(WATCH_CREATE_SPECTROGRAM), 0, "i", "iiiiiiiiS",   (SUBR) watch_create_spectrogram, NULL,                  (SUBR) watch_deinit,              NULL, 0 },
 
     { "watchadd.a",           S(WATCH_ADD_TIME),           0, "",  "ia",          (SUBR) watch_add_a_init,         (SUBR) watch_add_a,    NULL,                             NULL, 0 },
+    { "watchadd.k",           S(WATCH_ADD_TIME),           0, "",  "ik",          (SUBR) watch_add_k_init,         (SUBR) watch_add_k,    NULL,                             NULL, 0 },
     { "watchadd.f",           S(WATCH_ADD_SPECTRAL),       0, "",  "if",          (SUBR) watch_add_f_init,         (SUBR) watch_add_f,    NULL,                             NULL, 0 },
 
     { "watchtheme",           S(WATCH_THEME),              0, "",  "ii",          (SUBR) watch_theme,              NULL,                  NULL,                             NULL, 0 }

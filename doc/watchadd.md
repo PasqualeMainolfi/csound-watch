@@ -2,17 +2,19 @@
 
 ## Abstract
 
-Attach an a-rate or `f`-signal to a compatible watch graph.
+Attach an a-rate, k-rate, or `f`-signal to a compatible watch graph.
 
 ## Description
 
 `watchadd` connects a signal to a graph created by
-[`watchscope`](watchscope.md), [`watchspectrum`](watchspectrum.md), or
+[`watchscope`](watchscope.md), [`watchcontrol`](watchcontrol.md),
+[`watchspectrum`](watchspectrum.md), or
 [`watchspectrogram`](watchspectrogram.md).
 
 The opcode is selected automatically from the signal type:
 
 * an a-rate signal can be attached to `watchscope`;
+* a k-rate signal can be attached to `watchcontrol`;
 * an `f`-signal can be attached to `watchspectrum` or `watchspectrogram`.
 
 Several compatible signals can be attached to one graph. Each call creates a
@@ -27,6 +29,18 @@ required.
 
 Packets carry sample-position timestamps. The viewer uses one timeline for all
 audio streams belonging to the graph, preserving their phase relationship.
+
+### Control streams
+
+One k-rate value is collected per control cycle. Values are accumulated into
+packets of 256 samples before they are published to the sender. A discontinuity
+publishes the partial packet before accumulation resumes at the new control
+timestamp. When the graph ends, its final residual packet is also published and
+the graph remains alive until the sender has drained its queue.
+
+This batching adds up to approximately `256 / kr` seconds of latency before a
+complete packet becomes available to the sender. Packets carry control-cycle
+timestamps so compatible streams in the same graph share a timeline.
 
 ### Spectral streams
 
@@ -49,6 +63,7 @@ audio thread.
 
 ```csound
 watchadd(graph:i, signal:a)
+watchadd(graph:i, signal:k)
 watchadd(graph:i, signal:f)
 ```
 
@@ -57,6 +72,7 @@ watchadd(graph:i, signal:f)
 * `graph:i`: handle returned by a graph-creation opcode. Its domain must match
   the signal type.
 * `signal:a`: audio signal attached to a `watchscope` graph.
+* `signal:k`: control signal attached to a `watchcontrol` graph.
 * `signal:f`: non-sliding PVS signal attached to a `watchspectrum` or
   `watchspectrogram` graph.
 
@@ -94,13 +110,16 @@ nchnls = 2
 
 instr WatchSignals
     scope:i = watchscope(0.5, 10, 8, -1, 1, "Waveform")
+    control:i = watchcontrol(2, 10, 8, -1, 1, "Control signal")
     spectrum:i = watchspectrum(20, 12000, -120, 0, 2, 10, 8, "Spectrum")
     spectrogram:i = watchspectrogram(3, 20, 12000, -120, 0, 2, 8, 8, "Spectrogram")
 
     signal:a = vco2(0.35, 220)
+    modulation:k = oscili(0.8, 1)
     analysis:f = pvsanal(signal, 2048, 256, 2048, 1)
 
     watchadd(scope, signal)
+    watchadd(control, modulation)
     watchadd(spectrum, analysis)
     watchadd(spectrogram, analysis)
 
@@ -117,6 +136,7 @@ i "WatchSignals" 0 20
 ## See also
 
 * [`watchscope`](watchscope.md)
+* [`watchcontrol`](watchcontrol.md)
 * [`watchspectrum`](watchspectrum.md)
 * [`watchspectrogram`](watchspectrogram.md)
 * [watch overview](index.md)
