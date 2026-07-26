@@ -2,20 +2,22 @@
 
 ## Abstract
 
-Attach an a-rate, k-rate, or `f`-signal to a compatible watch graph.
+Attach an a-rate, k-rate, `f`-signal, or coordinate pair to a compatible watch
+graph.
 
 ## Description
 
 `watchadd` connects a signal to a graph created by
 [`watchscope`](watchscope.md), [`watchcontrol`](watchcontrol.md),
-[`watchspectrum`](watchspectrum.md), or
-[`watchspectrogram`](watchspectrogram.md).
+[`watchspectrum`](watchspectrum.md), [`watchspectrogram`](watchspectrogram.md),
+or [`watchpoint`](watchpoint.md).
 
-The opcode is selected automatically from the signal type:
+The opcode is selected automatically from the arguments:
 
 * an a-rate signal can be attached to `watchscope`;
 * a k-rate signal can be attached to `watchcontrol`;
-* an `f`-signal can be attached to `watchspectrum` or `watchspectrogram`.
+* an `f`-signal can be attached to `watchspectrum` or `watchspectrogram`;
+* two k-rate signals can be attached to `watchpoint`.
 
 Several compatible signals can be attached to one graph. Each call creates a
 separate stream, up to 64 concurrent streams per graph.
@@ -50,6 +52,17 @@ This batching adds up to approximately `256 / kr` seconds of latency before a
 complete packet becomes available to the sender. Packets carry control-cycle
 timestamps so compatible streams in the same graph share a timeline.
 
+### Point streams
+
+One coordinate pair is collected per control cycle and the two values travel
+interleaved in a single packet, so a point packet carries at most 128 points
+instead of 256 values.
+
+Point streams do not wait for a full packet: they publish once per viewer
+frame, which is `ceil(kr / 60)` points. A moving point is judged against the
+present by the eye, so the batching latency has to stay below the length of the
+trail rather than exceeding it.
+
 ### Spectral streams
 
 The `f`-signal must be non-sliding and use one of the PVS formats supported by
@@ -73,6 +86,7 @@ audio thread.
 watchadd(graph:i, signal:a)
 watchadd(graph:i, signal:k)
 watchadd(graph:i, signal:f)
+watchadd(graph:i, x:k, y:k)
 ```
 
 ## Arguments
@@ -83,6 +97,7 @@ watchadd(graph:i, signal:f)
 * `signal:k`: control signal attached to a `watchcontrol` graph.
 * `signal:f`: non-sliding PVS signal attached to a `watchspectrum` or
   `watchspectrogram` graph.
+* `x:k`, `y:k`: coordinate pair attached to a `watchpoint` graph.
 
 ## Output
 
@@ -147,6 +162,7 @@ i "WatchSignals" 0 20
 * [`watchcontrol`](watchcontrol.md)
 * [`watchspectrum`](watchspectrum.md)
 * [`watchspectrogram`](watchspectrogram.md)
+* [`watchpoint`](watchpoint.md)
 * [watch overview](index.md)
 
 ## Credits

@@ -204,15 +204,22 @@ static void send_stream_packets(WATCH_MANAGER *manager, WATCH_STREAM *stream) {
         }
 
         WATCH_STREAM_PACKET *packet = &stream->slots[read];
+
         uint32_t max_payload_size;
-        if (packet->header.type == DATA) {
-            max_payload_size = sizeof(WATCH_MSG_DATA);
-        } else if (packet->header.type == SPECTRAL_DATA) {
-            max_payload_size = sizeof(WATCH_MSG_SPECTRAL_DATA);
-        } else if (packet->header.type == FTABLE_DATA) {
-            max_payload_size = sizeof(WATCH_MSG_FTABLE_DATA);
-        } else {
-            max_payload_size = 0U;
+        switch (packet->header.type) {
+            case DATA:
+            case POINT_DATA:
+                max_payload_size = sizeof(WATCH_MSG_DATA);
+                break;
+            case SPECTRAL_DATA:
+                max_payload_size = sizeof(WATCH_MSG_SPECTRAL_DATA);
+                break;
+            case FTABLE_DATA:
+                max_payload_size = sizeof(WATCH_MSG_FTABLE_DATA);
+                break;
+            default:
+                max_payload_size = 0U;
+                break;
         }
 
         if (packet->header.payload_size > max_payload_size) {
@@ -849,7 +856,8 @@ static int32_t create_stream(
     WATCH_SIGNAL_DOMAIN first_domain,
     WATCH_SIGNAL_DOMAIN second_domain,
     float sample_rate,
-    WATCH_STREAM **result
+    WATCH_STREAM **result,
+    uint32_t float_per_sample
 ) {
     *result = NULL;
     WATCH_MANAGER *manager = csound->QueryGlobalVariable(csound, REGISTRY_NAME);
@@ -897,6 +905,24 @@ static int32_t create_stream(
     s->graph_id = graph->data_config.config.graph_id;
     s->stream_id = stream_slot;
     s->sample_rate = sample_rate;
+    s->float_per_sample = float_per_sample;
+
+    /*
+     * A packet is queued when it is full. That is the right trade-off for a
+     * scrolling display, but a moving point is compared against the current
+     * time by the eye: filling 128 points at kr = 1500 would show it a sixth of
+     * a second late. Point streams publish once per viewer frame instead.
+     */
+    uint32_t max_samples = (uint32_t) MAX_STREAM_SAMPLES / float_per_sample;
+    s->publish_threshold = max_samples;
+    if (domain == WATCH_DOMAIN_POINT) {
+        double frame_samples = ceil((double) sample_rate / (double) WATCH_VIEWER_REFRESH_HZ);
+        if (frame_samples >= 1.0 && frame_samples < (double) max_samples) {
+            s->publish_threshold = (uint32_t) frame_samples;
+        } else if (frame_samples < 1.0) {
+            s->publish_threshold = 1U;
+        }
+    }
 
     atomic_init(&s->pending_time_samples, 0);
     atomic_init(&s->write_pos, 0);
@@ -918,7 +944,8 @@ int32_t watch_add_a_init(CSOUND *csound, WATCH_ADD_TIME *p) {
         WATCH_DOMAIN_OSCILLOSCOPE,
         WATCH_DOMAIN_OSCILLOSCOPE,
         (float) p->h.insdshead->esr,
-        &p->stream
+        &p->stream,
+        1U
     );
 }
 
@@ -931,7 +958,7 @@ static void publish_time_packet(WATCH_STREAM *stream, unsigned next_write) {
     uint32_t pending = pending_time_samples(stream);
     WATCH_DATA_PACKET *packet = &stream->slots[write_pos].time;
     packet->data.sample_count = pending;
-    packet->header.payload_size = (uint32_t) offsetof(WATCH_MSG_DATA, samples) + pending * (uint32_t) sizeof(float);
+    packet->header.payload_size = (uint32_t) offsetof(WATCH_MSG_DATA, samples) + pending * stream->float_per_sample * (uint32_t) sizeof(float);
     atomic_store_explicit(&stream->pending_time_samples, 0U, memory_order_relaxed);
     atomic_store_explicit(&stream->write_pos, next_write, memory_order_release);
 }
@@ -1016,7 +1043,7 @@ int32_t watch_add_a(CSOUND *csound, WATCH_ADD_TIME *p) {
         }
 
         uint32_t remaining = end - source_pos;
-        uint32_t available = MAX_STREAM_SAMPLES - pending;
+        uint32_t available = stream->publish_threshold - pending;
         uint32_t chunk = remaining < available ? remaining : available;
 
         for (uint32_t i = 0; i < chunk; i++) {
@@ -1028,7 +1055,7 @@ int32_t watch_add_a(CSOUND *csound, WATCH_ADD_TIME *p) {
         source_pos += chunk;
         atomic_store_explicit(&stream->pending_time_samples, pending, memory_order_relaxed);
 
-        if (pending == MAX_STREAM_SAMPLES) {
+        if (pending == stream->publish_threshold) {
             publish_time_packet(stream, next_write);
         }
     }
@@ -1064,7 +1091,8 @@ static int32_t watch_add_f_init(CSOUND *csound, WATCH_ADD_SPECTRAL *p) {
         WATCH_DOMAIN_SPECTRUM,
         WATCH_DOMAIN_SPECTROGRAM,
         (float) p->h.insdshead->esr,
-        &p->stream
+        &p->stream,
+        1U
     );
 }
 
@@ -1229,7 +1257,8 @@ int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p) {
         WATCH_DOMAIN_FTABLE,
         WATCH_DOMAIN_FTABLE,
         (float) CS_ESR,
-        &p->stream
+        &p->stream,
+        1U
     );
 
     if (result != OK) {
@@ -1337,7 +1366,8 @@ int32_t watch_add_k_init(CSOUND *csound, WATCH_ADD_TIME *p) {
         WATCH_DOMAIN_CONTROL,
         WATCH_DOMAIN_CONTROL,
         (float) p->h.insdshead->ekr,
-        &p->stream
+        &p->stream,
+        1U
     );
 }
 
@@ -1381,13 +1411,104 @@ int32_t watch_add_k(CSOUND *csound, WATCH_ADD_TIME *p) {
         pending++;
         atomic_store_explicit(&stream->pending_time_samples, pending, memory_order_relaxed);
 
-        if (pending == MAX_STREAM_SAMPLES) {
+        if (pending == stream->publish_threshold) {
             publish_time_packet(stream, next_write);
         }
 
         return OK;
     }
 }
+
+int32_t watch_create_point(CSOUND *csound, WATCH_CREATE_POINT *p) {
+    *p->handle = (MYFLT) INVALID_HANDLE;
+
+    WATCH_MSG_GRAPH_SETTINGS settings = {0};
+    WATCH_MSG_POINT_CONFIG *config = &settings.point;
+
+    int32_t result;
+    result = numeric_range(csound, p->ymin, p->ymax, "y range", -FLT_MAX, FLT_MAX, &config->yrange);
+    if (result != OK) {
+        return result;
+    }
+
+    result = numeric_range(csound, p->xmin, p->xmax, "x range", -FLT_MAX, FLT_MAX, &config->xrange);
+    if (result != OK) {
+        return result;
+    }
+
+    return create_graph(csound, p->handle, WATCH_DOMAIN_POINT, &settings, p->title, WATCH_THEME_LIGHT);
+}
+
+
+int32_t watch_add_p_init(CSOUND *csound, WATCH_ADD_POINT *p) {
+    return create_stream(
+        csound,
+        p->handle,
+        WATCH_DOMAIN_POINT,
+        WATCH_DOMAIN_POINT,
+        (float) p->h.insdshead->ekr,
+        &p->stream,
+        2U
+    );
+}
+
+static int32_t watch_add_p_deinit(CSOUND *csound, WATCH_ADD_POINT *p) {
+    release_stream(csound, &p->stream);
+    return OK;
+}
+
+int32_t watch_add_p(CSOUND *csound, WATCH_ADD_POINT *p) {
+    (void) csound;
+    WATCH_STREAM *stream = p->stream;
+    int64_t sequence = (int64_t) p->h.insdshead->kcounter;
+
+    for (;;) {
+        unsigned write = atomic_load_explicit(&stream->write_pos, memory_order_relaxed);
+        unsigned next_write = (write + 1U) % MAX_QUEUE_SIZE;
+
+        WATCH_DATA_PACKET *packet = &stream->slots[write].point;
+        uint32_t pending = pending_time_samples(stream);
+
+        int64_t off_pend = stream->pending_time_sequence + (int64_t) pending;
+        if (pending > 0U && sequence != off_pend) {
+            publish_time_packet(stream, next_write);
+            continue;
+        }
+
+        if (pending == 0U) {
+            unsigned read = atomic_load_explicit(&stream->read_pos, memory_order_acquire);
+            if (next_write == read) {
+                atomic_fetch_add_explicit(&stream->dropped_samples, 1, memory_order_relaxed);
+                return OK;
+            }
+
+            packet->header.magic = WATCH_MAGIC;
+            packet->header.type = POINT_DATA;
+            packet->header.version = PROT_VERSION;
+            packet->header.sequence = sequence;
+
+            packet->data.graph_id = stream->graph_id;
+            packet->data.stream_id = stream->stream_id;
+            packet->data.sample_rate = stream->sample_rate;
+            stream->pending_time_sequence = sequence;
+        }
+
+        // interleaved
+        uint32_t base = pending * 2U;
+        packet->data.samples[base] = isfinite(*p->x) ? (float) *p->x : 0.0f;
+        packet->data.samples[base + 1U] = isfinite(*p->y) ? (float) *p->y : 0.0f;
+        pending++;
+        atomic_store_explicit(&stream->pending_time_samples, pending, memory_order_relaxed);
+
+        if (pending == stream->publish_threshold) {
+            publish_time_packet(stream, next_write);
+        }
+
+        return OK;
+    }
+}
+
+
 
 
 #define S(s) sizeof(s)
@@ -1420,9 +1541,13 @@ static OENTRY localops[] = {
     { "watchspectrogram.t",   S(WATCH_CREATE_SPECTROGRAM), 0, "i", "iiiiiioo",    (SUBR) watch_create_spectrogram, NULL,                  (SUBR) watch_deinit,              NULL, 0 },
     { "watchspectrogram.s",   S(WATCH_CREATE_SPECTROGRAM), 0, "i", "iiiiiiiiS",   (SUBR) watch_create_spectrogram, NULL,                  (SUBR) watch_deinit,              NULL, 0 },
 
+    { "watchpoint",           S(WATCH_CREATE_POINT),       0, "i", "iiii",        (SUBR) watch_create_point,       NULL,                  (SUBR) watch_deinit,              NULL, 0 },
+    { "watchpoint.s",         S(WATCH_CREATE_POINT),       0, "i", "iiiiS",       (SUBR) watch_create_point,       NULL,                  (SUBR) watch_deinit,              NULL, 0 },
+
     { "watchadd.a",           S(WATCH_ADD_TIME),           0, "",  "ia",          (SUBR) watch_add_a_init,         (SUBR) watch_add_a,    (SUBR) watch_add_deinit,          NULL, 0 },
     { "watchadd.k",           S(WATCH_ADD_TIME),           0, "",  "ik",          (SUBR) watch_add_k_init,         (SUBR) watch_add_k,    (SUBR) watch_add_deinit,          NULL, 0 },
     { "watchadd.f",           S(WATCH_ADD_SPECTRAL),       0, "",  "if",          (SUBR) watch_add_f_init,         (SUBR) watch_add_f,    (SUBR) watch_add_f_deinit,        NULL, 0 },
+    { "watchadd.p",           S(WATCH_ADD_POINT),          0, "",  "ikk",         (SUBR) watch_add_p_init,         (SUBR) watch_add_p,    (SUBR) watch_add_p_deinit,        NULL, 0 },
 
     { "watchtheme",           S(WATCH_THEME),              0, "",  "ii",          (SUBR) watch_theme,              NULL,                  NULL,                             NULL, 0 }
 };

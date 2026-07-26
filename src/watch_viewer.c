@@ -27,7 +27,7 @@
 #define MAX_PACKETS_PER_FRAME 4096
 #define DEFAULT_X_TICKS 10
 #define DEFAULT_Y_TICKS 8
-#define VIEWER_REFRESH_HZ 60U
+#define VIEWER_REFRESH_HZ WATCH_VIEWER_REFRESH_HZ
 #define NANOSECONDS_PER_SECOND 1000000000ULL
 #define VIEWER_SHUTDOWN_DELAY_MS 500U
 #define SCOPE_RENDER_LATENCY_MS 50U
@@ -37,6 +37,19 @@
 #define MAX_SPECTRAL_TOTAL_BINS 1048576U
 #define MAX_SPECTROGRAM_TEXELS 16777216ULL
 #define MAX_FTABLE_RENDER_BUCKETS 16384U
+/*
+ * A point graph keeps a short trail behind the moving point. The length is
+ * expressed in seconds so that the same constant produces the same look at any
+ * control rate; the sample count is derived from the rate carried by each
+ * packet. Below one display frame the trail collapses to a single dot and the
+ * direction of the movement is lost; above a third of a second fast paths
+ * smear into a blob.
+ */
+#define POINT_TRAIL_SECONDS 0.1f
+#define POINT_TRAIL_MAX_SAMPLES 16384U
+#define POINT_TRAIL_MIN_ALPHA 40.0f
+#define POINT_HEAD_SIZE 5.0f
+#define POINT_TICKS 8U
 #define AXIS_FONT_SIZE 15.0f
 #define TICK_FONT_SIZE 11.0f
 #define TICK_MARK_LENGTH 5.0f
@@ -160,6 +173,15 @@ typedef struct {
 } STREAM_FTABLE_BUFFER;
 
 typedef struct {
+    float *coordinates; // two floats per point, oldest to newest through the ring
+    SDL_FPoint *plot_points;
+    uint32_t capacity;
+    uint32_t write_index;
+    uint32_t valid_points;
+    float sample_rate;
+} STREAM_POINT_BUFFER;
+
+typedef struct {
     bool ready;
     WATCH_MSG_CONFIG config;
     watch_endpoint_t sender;
@@ -178,6 +200,7 @@ typedef struct {
     STREAM_TIME_BUFFER *scope_streams;
     STREAM_SPECTRAL_BUFFER *spectral_streams;
     STREAM_FTABLE_BUFFER *ftable_streams;
+    STREAM_POINT_BUFFER *point_streams;
     double scope_display_end_sample;
     uint64_t scope_last_render_ns;
     bool scope_display_started;
@@ -389,6 +412,9 @@ static const char *x_axis_label(const WATCH_MSG_CONFIG *config) {
     if (config->domain == WATCH_DOMAIN_FTABLE) {
         return "Table index";
     }
+    if (config->domain == WATCH_DOMAIN_POINT) {
+        return "x";
+    }
     return "Time (s)";
 }
 
@@ -412,6 +438,8 @@ static const char *y_axis_label(const WATCH_MSG_CONFIG *config) {
             return "Frequency (Hz)";
         case WATCH_DOMAIN_FTABLE:
             return "Value";
+        case WATCH_DOMAIN_POINT:
+            return "y";
         default:
             return "";
     }
@@ -763,7 +791,6 @@ static void draw_axis_labels(VIEW_GRAPH *graph, const PLOT_AREA *plot) {
     float mark_length = TICK_MARK_LENGTH * density;
     float tick_gap = TICK_LABEL_GAP * density;
     float axis_gap = AXIS_TICK_LABEL_GAP * density;
-    float outer_padding = PLOT_OUTER_PADDING * density;
     float x_tick_height = maximum_tick_height(&graph->tick_labels.x);
     float x_width = graph->x_axis_label.width;
     float x_height = graph->x_axis_label.height;
@@ -777,7 +804,15 @@ static void draw_axis_labels(VIEW_GRAPH *graph, const PLOT_AREA *plot) {
 
     float y_width = graph->y_axis_label.width;
     float y_height = graph->y_axis_label.height;
-    float y_center_x = outer_padding + y_height * 0.5f;
+    /*
+     * Anchored to the plot, like every other label, and not to the window: for
+     * the domains whose plot area fills the window this is the same position
+     * that get_plot_area() reserved, but a point graph shrinks its area to a
+     * square and the name has to follow its tick labels.
+     */
+    float y_tick_width = maximum_tick_width(&graph->tick_labels.y);
+    float y_center_x =
+        plot->left - mark_length - tick_gap - y_tick_width - axis_gap - y_height * 0.5f;
     SDL_FRect y_destination = {
         .x = y_center_x - y_width * 0.5f,
         .y = plot->y_center - y_height * 0.5f,
@@ -965,6 +1000,76 @@ static void free_ftable_buffers(STREAM_FTABLE_BUFFER *buffers) {
         clear_ftable_stream(&buffers[i]);
     }
     free(buffers);
+}
+
+static STREAM_POINT_BUFFER *prepare_point_buffers(void) {
+    return calloc(MAX_STREAMS, sizeof(STREAM_POINT_BUFFER));
+}
+
+static void clear_point_stream(STREAM_POINT_BUFFER *stream) {
+    if (stream == NULL) {
+        return;
+    }
+    free(stream->coordinates);
+    free(stream->plot_points);
+    memset(stream, 0, sizeof(*stream));
+}
+
+static void free_point_buffers(STREAM_POINT_BUFFER *buffers) {
+    if (buffers == NULL) {
+        return;
+    }
+    for (uint32_t i = 0U; i < MAX_STREAMS; i++) {
+        clear_point_stream(&buffers[i]);
+    }
+    free(buffers);
+}
+
+static uint32_t point_trail_capacity(float sample_rate) {
+    double samples = ceil((double) POINT_TRAIL_SECONDS * (double) sample_rate);
+    if (!(samples >= 2.0)) {
+        return 2U; // two points are the shortest visible segment
+    }
+    if (samples > (double) POINT_TRAIL_MAX_SAMPLES) {
+        return POINT_TRAIL_MAX_SAMPLES;
+    }
+    return (uint32_t) samples;
+}
+
+static bool ensure_point_buffer(STREAM_POINT_BUFFER *stream, float sample_rate) {
+    uint32_t capacity = point_trail_capacity(sample_rate);
+    if (stream->coordinates != NULL
+        && stream->plot_points != NULL
+        && stream->capacity == capacity) {
+        stream->sample_rate = sample_rate;
+        return true;
+    }
+
+    clear_point_stream(stream);
+
+    float *coordinates = calloc((size_t) capacity * 2U, sizeof(float));
+    SDL_FPoint *plot_points = calloc(capacity, sizeof(SDL_FPoint));
+    if (coordinates == NULL || plot_points == NULL) {
+        free(coordinates);
+        free(plot_points);
+        return false;
+    }
+
+    stream->coordinates = coordinates;
+    stream->plot_points = plot_points;
+    stream->capacity = capacity;
+    stream->sample_rate = sample_rate;
+    return true;
+}
+
+static void append_point(STREAM_POINT_BUFFER *stream, float x, float y) {
+    size_t base = (size_t) stream->write_index * 2U;
+    stream->coordinates[base] = isfinite(x) ? x : 0.0f;
+    stream->coordinates[base + 1U] = isfinite(y) ? y : 0.0f;
+    stream->write_index = (stream->write_index + 1U) % stream->capacity;
+    if (stream->valid_points < stream->capacity) {
+        stream->valid_points++;
+    }
 }
 
 static uint64_t scope_latency_samples(float sample_rate) {
@@ -1291,10 +1396,7 @@ static void draw_scope_stream(
                 first_in_column);
             float maximum = minimum;
             for (uint32_t i = first_in_column + 1U; i < end_in_column; i++) {
-                float sample = scope_display_sample(
-                    stream,
-                    first_buffer_index,
-                    i);
+                float sample = scope_display_sample(stream, first_buffer_index, i);
                 if (sample < minimum) {
                     minimum = sample;
                 }
@@ -1304,36 +1406,24 @@ static void draw_scope_stream(
             }
 
             float x = column_count > 1U
-                ? first_x
-                    + (float) column * raster_width / (float) (column_count - 1U)
+                ? first_x + (float) column * raster_width / (float) (column_count - 1U)
                 : first_x;
             float top = scope_sample_y(p, stream, maximum);
             float bottom = scope_sample_y(p, stream, minimum);
             float first_y = scope_sample_y(
                 p,
                 stream,
-                scope_display_sample(
-                    stream,
-                    first_buffer_index,
-                    first_in_column));
+                scope_display_sample(stream, first_buffer_index, first_in_column));
             if (has_previous) {
-                draw_waveform_line(
-                    renderer,
-                    previous_x,
-                    previous_y,
-                    x,
-                    first_y,
-                    supersampled);
+                draw_waveform_line(renderer, previous_x, previous_y, x, first_y, supersampled);
             }
             draw_scope_vertical(renderer, x, top, bottom, supersampled);
             previous_x = x;
             previous_y = scope_sample_y(
                 p,
                 stream,
-                scope_display_sample(
-                    stream,
-                    first_buffer_index,
-                    end_in_column - 1U));
+                scope_display_sample(stream, first_buffer_index, end_in_column - 1U)
+            );
             has_previous = true;
         }
         return;
@@ -1369,6 +1459,10 @@ static bool is_spectral_domain(WATCH_SIGNAL_DOMAIN domain) {
 
 static bool is_ftable_domain(WATCH_SIGNAL_DOMAIN domain) {
     return domain == WATCH_DOMAIN_FTABLE;
+}
+
+static bool is_point_domain(WATCH_SIGNAL_DOMAIN domain) {
+    return domain == WATCH_DOMAIN_POINT;
 }
 
 static float spectral_display_value(float power, WATCH_SPECTRAL_SCALE scale) {
@@ -1416,8 +1510,7 @@ static void spectral_grayscale(
 ) {
     float normalized = (value - minimum) / (maximum - minimum);
     normalized = fminf(fmaxf(normalized, 0.0f), 1.0f);
-    uint8_t light_shade =
-        (uint8_t) lroundf((1.0f - normalized) * 255.0f);
+    uint8_t light_shade = (uint8_t) lroundf((1.0f - normalized) * 255.0f);
     uint8_t shade = themed_component(theme, light_shade);
     rgba[0] = shade;
     rgba[1] = shade;
@@ -1589,6 +1682,7 @@ static void destroy_graph(VIEW_GRAPH *graph) {
     free_scope_buffers(graph->scope_streams);
     free_spectral_buffers(graph->spectral_streams);
     free_ftable_buffers(graph->ftable_streams);
+    free_point_buffers(graph->point_streams);
     destroy_text_label(&graph->x_axis_label);
     destroy_text_label(&graph->y_axis_label);
     destroy_tick_labels(&graph->tick_labels);
@@ -1694,7 +1788,7 @@ static bool validate_config_packet(const WATCH_CONFIG_PACKET *packet, int64_t re
         || packet->header.type != CONFIG
         || packet->header.payload_size != sizeof(WATCH_MSG_CONFIG)
         || packet->config.graph_id == 0U
-        || packet->config.domain > WATCH_DOMAIN_FTABLE
+        || packet->config.domain > WATCH_DOMAIN_POINT
         || packet->config.theme > WATCH_THEME_DARK
         || !valid_title(packet->config.title)) {
         return false;
@@ -1713,6 +1807,12 @@ static bool validate_config_packet(const WATCH_CONFIG_PACKET *packet, int64_t re
         const WATCH_MSG_FTABLE_CONFIG *config = &packet->config.settings.ftable;
         if (config->win_size == 0U
             || config->win_size > MAX_FTABLE_SAMPLES
+            || !valid_range(&config->yrange, false)) {
+            return false;
+        }
+    } else if (is_point_domain(packet->config.domain)) {
+        const WATCH_MSG_POINT_CONFIG *config = &packet->config.settings.point;
+        if (!valid_range(&config->xrange, false)
             || !valid_range(&config->yrange, false)) {
             return false;
         }
@@ -1774,6 +1874,29 @@ static bool validate_spectral_data_packet(const WATCH_SPECTRAL_DATA_PACKET *pack
     return packet->header.payload_size == expected_payload;
 }
 
+/*
+ * Point packets travel through the time-domain payload but their sample_count
+ * is a number of points: the payload carries two interleaved floats each.
+ */
+static bool validate_point_data_packet(const WATCH_DATA_PACKET *packet, int64_t received) {
+    if (!validate_header(&packet->header, received)
+        || packet->header.type != POINT_DATA
+        || packet->header.sequence < 0
+        || packet->data.graph_id == 0U
+        || packet->data.stream_id >= MAX_STREAMS
+        || !isfinite(packet->data.sample_rate)
+        || packet->data.sample_rate <= 0.0f
+        || packet->data.sample_count == 0U
+        || packet->data.sample_count > MAX_POINT_SAMPLES) {
+        return false;
+    }
+
+    uint32_t expected_payload =
+        (uint32_t) offsetof(WATCH_MSG_DATA, samples)
+        + packet->data.sample_count * 2U * (uint32_t) sizeof(float);
+    return packet->header.payload_size == expected_payload;
+}
+
 static bool validate_ftable_data_packet(
     const WATCH_FTABLE_DATA_PACKET *packet,
     int64_t received
@@ -1827,6 +1950,27 @@ static void resolve_scope_range(const WATCH_MSG_TIME_CONFIG *config, float *ymin
     } else {
         *ymin = config->yrange.min;
         *ymax = config->yrange.max;
+    }
+}
+
+/*
+ * The plane must stay still: an omitted limit falls back to a fixed default
+ * instead of being derived from the incoming points, which would make the axes
+ * drift under the moving point.
+ */
+static void resolve_point_range(const WATCH_RANGE *range, float *minimum, float *maximum) {
+    if (range->is_min_auto && range->is_max_auto) {
+        *minimum = -1.0f;
+        *maximum = 1.0f;
+    } else if (range->is_min_auto) {
+        *maximum = range->max;
+        *minimum = *maximum - 2.0f;
+    } else if (range->is_max_auto) {
+        *minimum = range->min;
+        *maximum = *minimum + 2.0f;
+    } else {
+        *minimum = range->min;
+        *maximum = range->max;
     }
 }
 
@@ -1929,6 +2073,15 @@ static bool ensure_graph_tick_labels(VIEW_GRAPH *graph) {
         xmax = config->win_size;
         resolve_scope_range(config, &ymin, &ymax);
         x_format = TICK_FORMAT_TIME;
+        y_format = TICK_FORMAT_NUMBER;
+    } else if (is_point_domain(graph->config.domain)) {
+        const WATCH_MSG_POINT_CONFIG *config = &graph->config.settings.point;
+        resolve_point_range(&config->xrange, &xmin, &xmax);
+        resolve_point_range(&config->yrange, &ymin, &ymax);
+        // a plane reads better with the same number of divisions on both axes
+        x_intervals = POINT_TICKS;
+        y_intervals = POINT_TICKS;
+        x_format = TICK_FORMAT_NUMBER;
         y_format = TICK_FORMAT_NUMBER;
     } else if (is_ftable_domain(graph->config.domain)) {
         const WATCH_MSG_FTABLE_CONFIG *config = &graph->config.settings.ftable;
@@ -2054,6 +2207,11 @@ static VIEW_GRAPH *create_graph(VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS], const WATC
         if (graph->ftable_streams == NULL) {
             return NULL;
         }
+    } else if (is_point_domain(config->domain)) {
+        graph->point_streams = prepare_point_buffers();
+        if (graph->point_streams == NULL) {
+            return NULL;
+        }
     } else {
         return NULL;
     }
@@ -2070,6 +2228,8 @@ static VIEW_GRAPH *create_graph(VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS], const WATC
             free_scope_buffers(graph->scope_streams);
         } else if (is_spectral_domain(config->domain)) {
             free_spectral_buffers(graph->spectral_streams);
+        } else if (is_point_domain(config->domain)) {
+            free_point_buffers(graph->point_streams);
         } else {
             free_ftable_buffers(graph->ftable_streams);
         }
@@ -2395,6 +2555,42 @@ static bool prepare_ftable_envelope(STREAM_FTABLE_BUFFER *stream) {
     stream->envelope_maximums = maximums;
     stream->envelope_count = count;
     return true;
+}
+
+static void process_point_packet(
+    VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS],
+    const WATCH_DATA_PACKET *packet,
+    int64_t received,
+    const watch_endpoint_t *sender
+) {
+    if (!validate_point_data_packet(packet, received)) {
+        return;
+    }
+
+    VIEW_GRAPH *graph = find_graph(graphs, packet->data.graph_id, sender);
+    if (graph == NULL
+        || !is_point_domain(graph->config.domain)
+        || graph->point_streams == NULL) {
+        return;
+    }
+
+    STREAM_POINT_BUFFER *stream = &graph->point_streams[packet->data.stream_id];
+    if (!ensure_point_buffer(stream, packet->data.sample_rate)) {
+        SDL_Log(
+            "[watch-viewer] graph %u stream %u point buffer initialization failed "
+            "(sample rate %.6g Hz)",
+            packet->data.graph_id,
+            packet->data.stream_id,
+            (double) packet->data.sample_rate);
+        return;
+    }
+
+    for (uint32_t i = 0U; i < packet->data.sample_count; i++) {
+        append_point(
+            stream,
+            packet->data.samples[i * 2U],
+            packet->data.samples[i * 2U + 1U]);
+    }
 }
 
 static void process_ftable_packet(
@@ -2821,6 +3017,125 @@ static void render_ftable(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled)
     SDL_SetRenderClipRect(graph->renderer, NULL);
 }
 
+/*
+ * A plane must keep equal units per pixel on both axes, otherwise a circular
+ * path is drawn as an ellipse. The largest centred square inside the plot area
+ * is used and every label follows it, because they are positioned from the same
+ * PLOT_AREA.
+ */
+static PLOT_AREA square_plot_area(const PLOT_AREA *plot) {
+    PLOT_AREA squared = *plot;
+    if (plot->plot_width <= 0.0f || plot->plot_heigth <= 0.0f) {
+        return squared;
+    }
+
+    float side = fminf(plot->plot_width, plot->plot_heigth);
+    squared.left = plot->x_center - side * 0.5f;
+    squared.right = plot->x_center + side * 0.5f;
+    squared.top = plot->y_center - side * 0.5f;
+    squared.bottom = plot->y_center + side * 0.5f;
+    squared.plot_width = side;
+    squared.plot_heigth = side;
+    return squared;
+}
+
+static float point_axis_x(const PLOT_AREA *plot, float value, float minimum, float maximum) {
+    return plot->left + ((value - minimum) / (maximum - minimum)) * plot->plot_width;
+}
+
+static float point_axis_y(const PLOT_AREA *plot, float value, float minimum, float maximum) {
+    return plot->bottom - ((value - minimum) / (maximum - minimum)) * plot->plot_heigth;
+}
+
+static void render_point(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled) {
+    const WATCH_MSG_POINT_CONFIG *config = &graph->config.settings.point;
+    float density = graph_pixel_density(graph);
+    draw_grid(
+        graph->renderer,
+        plot,
+        density,
+        (int) POINT_TICKS,
+        (int) POINT_TICKS,
+        graph->config.theme);
+
+    float xmin;
+    float xmax;
+    float ymin;
+    float ymax;
+    resolve_point_range(&config->xrange, &xmin, &xmax);
+    resolve_point_range(&config->yrange, &ymin, &ymax);
+    if (!(xmax > xmin) || !(ymax > ymin)) {
+        return;
+    }
+
+    set_themed_draw_color(graph->renderer, graph->config.theme, 0U, 255U);
+    if (ymin <= 0.0f && ymax >= 0.0f) {
+        float zero = point_axis_y(plot, 0.0f, ymin, ymax);
+        SDL_RenderLine(graph->renderer, plot->left, zero, plot->right - 1.0f, zero);
+    }
+    if (xmin <= 0.0f && xmax >= 0.0f) {
+        float zero = point_axis_x(plot, 0.0f, xmin, xmax);
+        SDL_RenderLine(graph->renderer, zero, plot->top, zero, plot->bottom - 1.0f);
+    }
+
+    SDL_Rect clip = get_plot_clip_rect(plot);
+    SDL_SetRenderClipRect(graph->renderer, &clip);
+
+    for (uint32_t stream_index = 0U; stream_index < MAX_STREAMS; stream_index++) {
+        STREAM_POINT_BUFFER *stream = &graph->point_streams[stream_index];
+        if (stream->coordinates == NULL
+            || stream->plot_points == NULL
+            || stream->valid_points == 0U) {
+            continue;
+        }
+
+        uint32_t first = (stream->write_index + stream->capacity - stream->valid_points) % stream->capacity;
+        for (uint32_t i = 0U; i < stream->valid_points; i++) {
+            size_t base = (size_t) ((first + i) % stream->capacity) * 2U;
+            stream->plot_points[i].x = point_axis_x(plot, stream->coordinates[base], xmin, xmax);
+            stream->plot_points[i].y = point_axis_y(plot, stream->coordinates[base + 1U], ymin, ymax);
+        }
+
+        set_stream_draw_color(graph->renderer, graph->config.theme, stream_index);
+        uint8_t red;
+        uint8_t green;
+        uint8_t blue;
+        uint8_t alpha;
+        SDL_GetRenderDrawColor(graph->renderer, &red, &green, &blue, &alpha);
+
+        /*
+         * The trail fades towards the oldest end so that the direction of the
+         * movement is readable from a single frame.
+         */
+        for (uint32_t i = 1U; i < stream->valid_points; i++) {
+            float age = stream->valid_points > 1U
+                ? (float) i / (float) (stream->valid_points - 1U)
+                : 1.0f;
+            float segment_alpha = POINT_TRAIL_MIN_ALPHA + (255.0f - POINT_TRAIL_MIN_ALPHA) * age;
+            SDL_SetRenderDrawColor(graph->renderer, red, green, blue, (uint8_t) lrintf(segment_alpha));
+            SDL_RenderLine(
+                graph->renderer,
+                stream->plot_points[i - 1U].x,
+                stream->plot_points[i - 1U].y,
+                stream->plot_points[i].x,
+                stream->plot_points[i].y);
+        }
+
+        SDL_SetRenderDrawColor(graph->renderer, red, green, blue, 255U);
+        const SDL_FPoint *head = &stream->plot_points[stream->valid_points - 1U];
+        float size = POINT_HEAD_SIZE * density * (supersampled ? 1.0f : 0.8f);
+        SDL_FRect head_rect = {
+            .x = head->x - size * 0.5f,
+            .y = head->y - size * 0.5f,
+            .w = size,
+            .h = size
+        };
+        SDL_RenderFillRect(graph->renderer, &head_rect);
+    }
+
+    SDL_SetRenderClipRect(graph->renderer, NULL);
+}
+
 static void render_graph(VIEW_GRAPH *graph) {
     if (!graph->ready || graph->renderer == NULL) {
         return;
@@ -2843,6 +3158,9 @@ static void render_graph(VIEW_GRAPH *graph) {
     }
 
     PLOT_AREA plot = get_plot_area(graph);
+    if (is_point_domain(graph->config.domain)) {
+        plot = square_plot_area(&plot);
+    }
     SDL_FRect border = {
         .x = plot.left,
         .y = plot.top,
@@ -2916,6 +3234,8 @@ static void render_graph(VIEW_GRAPH *graph) {
         render_spectrogram(graph, &plot);
     } else if (graph->config.domain == WATCH_DOMAIN_FTABLE) {
         render_ftable(graph, &plot, supersampled);
+    } else if (graph->config.domain == WATCH_DOMAIN_POINT) {
+        render_point(graph, &plot, supersampled);
     }
 
     set_themed_draw_color(
@@ -3041,6 +3361,9 @@ int main(int argc, char *argv[]) {
                     break;
                 case FTABLE_DATA:
                     process_ftable_packet(graphs, &packet.ftable, received, &sender);
+                    break;
+                case POINT_DATA:
+                    process_point_packet(graphs, &packet.data, received, &sender);
                     break;
                 case SESSION_CLOSE:
                     if (process_session_close_packet(graphs, &packet.close, received, &sender) > 0U && !has_opened_graph(graphs)) {

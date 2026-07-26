@@ -4,11 +4,13 @@
 #include <stdint.h>
 
 #define MAX_STREAM_SAMPLES 256
+#define MAX_POINT_SAMPLES (MAX_STREAM_SAMPLES / 2U)
 #define MAX_SPECTRAL_BINS 256
 #define MAX_STREAMS 64
 #define MAX_TITLE_SIZE 384
 #define MAX_FTABLE_SAMPLES (1U << 30)
 #define MAX_GRID_TICKS 256U
+#define WATCH_VIEWER_REFRESH_HZ 60U
 #define PROT_VERSION 4
 #define WATCH_MAGIC 0x57415448
 // local address
@@ -22,7 +24,8 @@ enum {
     WATCH_DOMAIN_SPECTRUM     = 1U,
     WATCH_DOMAIN_CONTROL      = 2U,
     WATCH_DOMAIN_SPECTROGRAM  = 3U,
-    WATCH_DOMAIN_FTABLE       = 4U
+    WATCH_DOMAIN_FTABLE       = 4U,
+    WATCH_DOMAIN_POINT        = 5U
 };
 
 typedef uint32_t WATCH_SPECTRAL_FORMAT;
@@ -52,7 +55,8 @@ typedef enum {
     ACK,
     SPECTRAL_DATA,
     SESSION_CLOSE,
-    FTABLE_DATA
+    FTABLE_DATA,
+    POINT_DATA
 } MSG_TYPE;
 
 typedef struct {
@@ -123,10 +127,16 @@ typedef struct {
     WATCH_RANGE yrange;
 } WATCH_MSG_FTABLE_CONFIG;
 
+typedef struct {
+    WATCH_RANGE xrange;
+    WATCH_RANGE yrange;
+} WATCH_MSG_POINT_CONFIG;
+
 typedef union {
     WATCH_MSG_TIME_CONFIG time;
     WATCH_MSG_SPECTRAL_CONFIG spectral;
     WATCH_MSG_FTABLE_CONFIG ftable;
+    WATCH_MSG_POINT_CONFIG point;
 } WATCH_MSG_GRAPH_SETTINGS;
 
 typedef struct {

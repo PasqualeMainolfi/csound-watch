@@ -2,8 +2,8 @@
 
 Csound Watch is a Csound 7 plugin for real-time signal visualization. It
 provides simple opcodes for creating oscilloscope, control-signal, spectrum,
-spectrogram, and static function-table windows while keeping all graphics work
-outside Csound's audio thread.
+spectrogram, static function-table, and moving-point windows while keeping all
+graphics work outside Csound's audio thread.
 
 Graphs are created with an init-time opcode and signals are attached with
 `watchadd`:
@@ -35,6 +35,7 @@ and normally terminates shortly after Csound stops.
 - Power-spectrum visualization of non-sliding PVS `f`-signals.
 - Scrolling spectrograms from non-sliding PVS `f`-signals.
 - Complete, init-time plotting of function tables.
+- Moving points with a fading trail on a fixed, square plane.
 - Gain, power, and decibel spectral display scales.
 - Several compatible streams in the same graph.
 - Shared sample timeline for synchronized time-domain streams.
@@ -95,8 +96,9 @@ The transport is intended for responsive visualization, not lossless recording.
 | [`watchspectrum`](doc/watchspectrum.md) | Frequency | Create a power-spectrum graph |
 | [`watchspectrogram`](doc/watchspectrogram.md) | Time/frequency | Create a scrolling spectrogram |
 | [`watchtable`](doc/watchtable.md) | Table index | Plot a complete function table |
+| [`watchpoint`](doc/watchpoint.md) | Plane | Create a fixed plane for moving points |
 | [`watchtheme`](doc/watchtheme.md) | Graph appearance | Select the light or dark theme |
-| [`watchadd`](doc/watchadd.md) | Time or frequency | Attach an a-rate, k-rate, or `f`-signal to a graph |
+| [`watchadd`](doc/watchadd.md) | Any | Attach a signal or a coordinate pair to a graph |
 
 ### `watchscope`
 
@@ -141,9 +143,10 @@ graph:i = watchcontrol(win_size:i, x_ticks:i, y_ticks:i, ymin:i, ymax:i, title:S
 
 One value is collected per k-cycle. Values are accumulated into packets of 256
 samples before transmission; a discontinuity, or the end of the attaching
-instrument instance, publishes a shorter final packet. Consequently, packet batching adds up to approximately
-`256 / kr` seconds of latency before a new batch becomes available to the
-sender. Tick arguments affect only the grid and labels.
+instrument instance, publishes a shorter final packet. Consequently, packet
+batching adds up to approximately `256 / kr` seconds of latency before a new
+batch becomes available to the sender. Tick arguments affect only the grid and
+labels.
 
 ### `watchspectrum`
 
@@ -210,6 +213,20 @@ chunks. The x-axis contains table indices. A limit that is left out of the call
 is derived from the completed table. The viewer does not expose a partial plot:
 rendering begins only after every sample has been assembled. `theme` is `0`
 for light and `1` for dark.
+
+### `watchpoint`
+
+```csound
+graph:i = watchpoint(xmin:i, xmax:i, ymin:i, ymax:i)
+graph:i = watchpoint(xmin:i, xmax:i, ymin:i, ymax:i, title:S)
+```
+
+`watchpoint` creates a plane on which each attached coordinate pair is drawn as
+a moving point followed by a fading trail of about 100 ms. Neither axis is
+time: the four limits fix the visible plane once, and the axes never rescale to
+the incoming coordinates. The plot area is kept square so that a circular path
+is drawn as a circle rather than an ellipse, and the grid uses eight divisions
+per axis. A zero axis appears only when the corresponding range contains zero.
 
 ### `watchtheme`
 
@@ -303,6 +320,7 @@ Additional ready-to-run files are available in [`examples`](examples):
 - [`watchspectrum.csd`](examples/watchspectrum.csd)
 - [`watchspectrogram.csd`](examples/watchspectrogram.csd)
 - [`watchtable.csd`](examples/watchtable.csd)
+- [`watchpoint.csd`](examples/watchpoint.csd)
 - [`watchadd.csd`](examples/watchadd.csd)
 
 ## Runtime requirements
@@ -519,11 +537,12 @@ OPCODE7DIR64="$PWD/build" csound utest/registry.csd
 | [`spectral.csd`](utest/spectral.csd) | Spectrum and spectrogram graph creation |
 | [`spectral_audio.csd`](utest/spectral_audio.csd) | Spectral streams fed by real audio |
 | [`table_gens.csd`](utest/table_gens.csd) | GEN5, GEN7 and GEN8 tables with automatic and explicit ranges |
+| [`point.csd`](utest/point.csd) | Plane aspect, trail, several points, asymmetric ranges |
 | [`ftable_transfer.csd`](utest/ftable_transfer.csd) | Deferred table transfer and graph cleanup |
 | [`theme.csd`](utest/theme.csd) | Light and dark themes |
 
-The graph tests are also visual: `control_ranges.csd` and `table_gens.csd`
-carry the expected zero-line position in each window title.
+The graph tests are also visual: `control_ranges.csd`, `table_gens.csd` and
+`point.csd` carry the expected result in each window title.
 
 ## Viewer discovery and lifecycle
 
@@ -565,6 +584,9 @@ viewer immediately.
 | Maximum streams per graph | 64 concurrent; a slot is released when the attaching instance ends |
 | Audio samples per packet | Up to 256 |
 | Control samples per packet | Up to 256 |
+| Point samples per packet | Up to 128 (two interleaved floats each) |
+| Point publishing cadence | `ceil(kr / 60)` points, one viewer frame |
+| Point trail length | Approximately 100 ms, derived from `kr` |
 | Spectral bins per packet | Up to 256 |
 | Function-table samples per packet | Up to 256 |
 | Maximum function-table size | 1,073,741,824 samples (`Csound MAXLEN`) |
@@ -656,6 +678,7 @@ Watch is not designed as a signal recorder.
 - [`watchspectrum`](doc/watchspectrum.md)
 - [`watchspectrogram`](doc/watchspectrogram.md)
 - [`watchtable`](doc/watchtable.md)
+- [`watchpoint`](doc/watchpoint.md)
 - [`watchtheme`](doc/watchtheme.md)
 - [`watchadd`](doc/watchadd.md)
 

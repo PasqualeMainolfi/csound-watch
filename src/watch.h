@@ -43,6 +43,7 @@ typedef union {
     WATCH_DATA_PACKET time;
     WATCH_SPECTRAL_DATA_PACKET spectral;
     WATCH_FTABLE_DATA_PACKET ftable;
+    WATCH_DATA_PACKET point;
 } WATCH_STREAM_PACKET;
 
 typedef struct {
@@ -61,6 +62,8 @@ typedef struct {
     uint32_t ftable_next_sample;
     uint32_t ftable_transfer_id;
     int64_t ftable_sequence;
+    uint32_t float_per_sample;
+    uint32_t publish_threshold; // samples accumulated before a packet is queued
 } WATCH_STREAM;
 
 typedef struct {
@@ -203,6 +206,8 @@ typedef struct {
     MYFLT *handle;
     MYFLT *x;
     MYFLT *y;
+    // private
+    WATCH_STREAM *stream;
 } WATCH_ADD_POINT;
 
 typedef struct {

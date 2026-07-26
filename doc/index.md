@@ -13,6 +13,7 @@ The current implementation provides:
 * power spectra from non-sliding `f`-signals;
 * spectrograms from non-sliding `f`-signals;
 * static plots of complete function tables;
+* moving points on a fixed plane from k-rate coordinate pairs;
 * selectable light and dark graph themes.
 
 ## Architecture
@@ -23,9 +24,10 @@ thread.
 During performance, `watchadd` copies audio samples, control values, or spectral
 bins into a bounded, preallocated ring buffer. Control values are accumulated
 into 256-sample packets, with the final residual packet published when the
-attaching instrument instance ends. A dedicated sender thread reads the buffer
-and sends small binary packets
-over UDP to `127.0.0.1:48120`. The viewer receives the packets, reconstructs
+attaching instrument instance ends. Point streams publish once per viewer frame
+instead, because the eye compares a moving point against the present. A
+dedicated sender thread reads the buffer and sends small binary packets over UDP
+to `127.0.0.1:48120`. The viewer receives the packets, reconstructs
 each signal window or spectral frame, and renders it in a separate process.
 
 The performance opcode does not perform socket I/O, allocate viewer memory, or
@@ -78,8 +80,9 @@ exiting. A new graph arriving during that interval cancels the shutdown.
 | [`watchspectrum`](watchspectrum.md) | Create a power-spectrum graph |
 | [`watchspectrogram`](watchspectrogram.md) | Create a scrolling spectrogram |
 | [`watchtable`](watchtable.md) | Plot a complete function table |
+| [`watchpoint`](watchpoint.md) | Create a fixed plane for moving points |
 | [`watchtheme`](watchtheme.md) | Select a graph's light or dark theme |
-| [`watchadd`](watchadd.md) | Attach an a-rate, k-rate, or `f`-signal to a graph |
+| [`watchadd`](watchadd.md) | Attach a signal or a coordinate pair to a graph |
 
 ## Common behavior and limits
 
@@ -100,6 +103,9 @@ exiting. A new graph arriving during that interval cancels the shutdown.
   The zero line is drawn only when the range contains zero, at the relative
   height `(0 - ymin) / (ymax - ymin)`: on the bottom edge for `0..1`, at the
   centre for `-1..1`, and not at all for a range such as `20..20000`.
+* A point graph draws a fixed plane: the axes never rescale to the incoming
+  coordinates, the plot area is kept square so that circular paths are not
+  drawn as ellipses, and each point keeps a trail of about 100 ms.
 * Communication is local UDP. It is intended for visualization, not lossless
   recording.
 
