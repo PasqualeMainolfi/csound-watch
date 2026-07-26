@@ -50,6 +50,7 @@
 #define POINT_TRAIL_MIN_ALPHA 40.0f
 #define POINT_HEAD_SIZE 5.0f
 #define POINT_TICKS 8U
+#define CONFIG_FAILURE_LOG_INTERVAL_NS 2000000000ULL
 #define AXIS_FONT_SIZE 15.0f
 #define TICK_FONT_SIZE 11.0f
 #define TICK_MARK_LENGTH 5.0f
@@ -131,6 +132,7 @@ typedef struct {
     uint64_t total_samples;
     int64_t next_sequence;
     bool has_sequence;
+    bool unsupported;
 } STREAM_TIME_BUFFER;
 
 typedef struct {
@@ -153,6 +155,7 @@ typedef struct {
     bool has_frame;
     bool assembling;
     bool display_ready;
+    bool unsupported;
 } STREAM_SPECTRAL_BUFFER;
 
 typedef struct {
@@ -170,6 +173,7 @@ typedef struct {
     bool has_range;
     bool assembling;
     bool display_ready;
+    bool unsupported;
 } STREAM_FTABLE_BUFFER;
 
 typedef struct {
@@ -179,6 +183,7 @@ typedef struct {
     uint32_t write_index;
     uint32_t valid_points;
     float sample_rate;
+    bool unsupported;
 } STREAM_POINT_BUFFER;
 
 typedef struct {
@@ -932,17 +937,37 @@ static STREAM_TIME_BUFFER *prepare_scope_buffers(void) {
     return calloc(MAX_STREAMS, sizeof(STREAM_TIME_BUFFER));
 }
 
+static void clear_scope_stream(STREAM_TIME_BUFFER *stream) {
+    if (stream == NULL) {
+        return;
+    }
+    free(stream->buffer);
+    free(stream->plot_points);
+    memset(stream, 0, sizeof(*stream));
+}
+
 static void free_scope_buffers(STREAM_TIME_BUFFER *buffers) {
     if (buffers == NULL) {
         return;
     }
 
     for (uint32_t i = 0; i < MAX_STREAMS; i++) {
-        free(buffers[i].buffer);
-        free(buffers[i].plot_points);
+        clear_scope_stream(&buffers[i]);
     }
 
     free(buffers);
+}
+
+/*
+ * A stream whose geometry the viewer cannot honour is remembered instead of
+ * being retried: the same packet stream would otherwise repeat the failed
+ * allocation, and the diagnostic, for every packet that arrives.
+ */
+static bool reject_scope_stream(STREAM_TIME_BUFFER *stream, float sample_rate) {
+    clear_scope_stream(stream);
+    stream->sample_rate = sample_rate;
+    stream->unsupported = true;
+    return false;
 }
 
 static STREAM_SPECTRAL_BUFFER *prepare_spectral_buffers(void) {
@@ -1037,6 +1062,10 @@ static uint32_t point_trail_capacity(float sample_rate) {
 }
 
 static bool ensure_point_buffer(STREAM_POINT_BUFFER *stream, float sample_rate) {
+    if (stream->unsupported && stream->sample_rate == sample_rate) {
+        return false;
+    }
+
     uint32_t capacity = point_trail_capacity(sample_rate);
     if (stream->coordinates != NULL
         && stream->plot_points != NULL
@@ -1052,6 +1081,9 @@ static bool ensure_point_buffer(STREAM_POINT_BUFFER *stream, float sample_rate) 
     if (coordinates == NULL || plot_points == NULL) {
         free(coordinates);
         free(plot_points);
+        clear_point_stream(stream);
+        stream->sample_rate = sample_rate;
+        stream->unsupported = true;
         return false;
     }
 
@@ -1078,15 +1110,19 @@ static uint64_t scope_latency_samples(float sample_rate) {
 }
 
 static bool ensure_scope_buffer(STREAM_TIME_BUFFER *stream, float win_size, float sample_rate, float ymin, float ymax) {
+    if (stream->unsupported && stream->sample_rate == sample_rate) {
+        return false;
+    }
+
     double requested_length = (double) win_size * (double) sample_rate;
     if (!isfinite(requested_length) || requested_length <= 0.0 || requested_length > (double) INT_MAX) {
-        return false;
+        return reject_scope_stream(stream, sample_rate);
     }
     uint32_t window_samples = (uint32_t) ceil(requested_length);
     uint64_t latency_samples = scope_latency_samples(sample_rate);
     uint64_t requested_capacity = (uint64_t) window_samples + latency_samples + MAX_STREAM_SAMPLES;
     if (requested_capacity > INT_MAX) {
-        return false;
+        return reject_scope_stream(stream, sample_rate);
     }
     uint32_t capacity = (uint32_t) requested_capacity;
 
@@ -1099,9 +1135,7 @@ static bool ensure_scope_buffer(STREAM_TIME_BUFFER *stream, float win_size, floa
         return true;
     }
 
-    free(stream->buffer);
-    free(stream->plot_points);
-    memset(stream, 0, sizeof(*stream));
+    clear_scope_stream(stream);
 
     float *buffer = calloc(capacity, sizeof(float));
     SDL_FPoint *plot_points = calloc(window_samples, sizeof(SDL_FPoint));
@@ -1109,7 +1143,7 @@ static bool ensure_scope_buffer(STREAM_TIME_BUFFER *stream, float win_size, floa
     if (buffer == NULL || plot_points == NULL) {
         free(buffer);
         free(plot_points);
-        return false;
+        return reject_scope_stream(stream, sample_rate);
     }
 
     stream->buffer = buffer;
@@ -1584,6 +1618,19 @@ static SDL_Texture *create_spectrogram_texture(
     return texture;
 }
 
+static bool reject_spectral_stream(
+    STREAM_SPECTRAL_BUFFER *stream,
+    const WATCH_MSG_SPECTRAL_DATA *data
+) {
+    clear_spectral_stream(stream);
+    stream->fft_size = data->fft_size;
+    stream->hop_size = data->hop_size;
+    stream->sample_rate = data->sample_rate;
+    stream->total_bins = data->total_bins;
+    stream->unsupported = true;
+    return false;
+}
+
 static bool ensure_spectral_stream(
     VIEW_GRAPH *graph,
     STREAM_SPECTRAL_BUFFER *stream,
@@ -1596,6 +1643,13 @@ static bool ensure_spectral_stream(
         && stream->hop_size == data->hop_size
         && stream->sample_rate == data->sample_rate
         && stream->total_bins == data->total_bins;
+    if (stream->unsupported
+        && stream->fft_size == data->fft_size
+        && stream->hop_size == data->hop_size
+        && stream->sample_rate == data->sample_rate
+        && stream->total_bins == data->total_bins) {
+        return false;
+    }
     if (metadata_matches) {
         if (graph->config.domain == WATCH_DOMAIN_SPECTRUM) {
             return stream->display_bins != NULL && stream->plot_points != NULL;
@@ -1608,8 +1662,7 @@ static bool ensure_spectral_stream(
     stream->assembly_bins = calloc(data->total_bins, sizeof(float));
     stream->received_bins = calloc(data->total_bins, sizeof(uint8_t));
     if (stream->assembly_bins == NULL || stream->received_bins == NULL) {
-        clear_spectral_stream(stream);
-        return false;
+        return reject_spectral_stream(stream, data);
     }
 
     stream->fft_size = data->fft_size;
@@ -1621,8 +1674,7 @@ static bool ensure_spectral_stream(
         stream->display_bins = calloc(data->total_bins, sizeof(float));
         stream->plot_points = calloc(data->total_bins, sizeof(SDL_FPoint));
         if (stream->display_bins == NULL || stream->plot_points == NULL) {
-            clear_spectral_stream(stream);
-            return false;
+            return reject_spectral_stream(stream, data);
         }
         return true;
     }
@@ -1633,8 +1685,7 @@ static bool ensure_spectral_stream(
         || requested_history < 1.0
         || requested_history > INT_MAX
         || requested_history * data->total_bins > MAX_SPECTROGRAM_TEXELS) {
-        clear_spectral_stream(stream);
-        return false;
+        return reject_spectral_stream(stream, data);
     }
 
     stream->history_capacity = (uint32_t) requested_history;
@@ -1645,8 +1696,7 @@ static bool ensure_spectral_stream(
         data->total_bins,
         graph->config.theme);
     if (stream->color_column == NULL || stream->history_texture == NULL) {
-        clear_spectral_stream(stream);
-        return false;
+        return reject_spectral_stream(stream, data);
     }
 
     return true;
@@ -2304,6 +2354,22 @@ static void apply_graph_theme(
     }
 }
 
+/*
+ * Configuration packets are retried by the sender until they are acknowledged,
+ * so a condition that cannot be resolved here - no free viewer slot, a refused
+ * window - would repeat its diagnostic four times per second for the whole
+ * session.
+ */
+static bool should_report_config_failure(void) {
+    static uint64_t last_report_ns = 0U;
+    uint64_t now_ns = SDL_GetTicksNS();
+    if (last_report_ns != 0U && now_ns - last_report_ns < CONFIG_FAILURE_LOG_INTERVAL_NS) {
+        return false;
+    }
+    last_report_ns = now_ns;
+    return true;
+}
+
 static void process_config_packet(
     watch_socket_t receiver_socket,
     VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS],
@@ -2319,14 +2385,17 @@ static void process_config_packet(
     if (graph == NULL) {
         graph = create_graph(graphs, &packet->config, sender);
         if (graph == NULL) {
-            SDL_Log("[watch-viewer] graph %u initialization failed", packet->config.graph_id);
+            if (should_report_config_failure()) {
+                SDL_Log("[watch-viewer] graph %u initialization failed", packet->config.graph_id);
+            }
             return;
         }
     } else {
         apply_graph_theme(graph, packet->config.theme);
     }
 
-    if (!send_config_ack(receiver_socket, sender, packet)) {
+    if (!send_config_ack(receiver_socket, sender, packet)
+        && should_report_config_failure()) {
         SDL_Log("[watch-viewer] graph %u ACK failed", packet->config.graph_id);
     }
 }
@@ -2373,7 +2442,11 @@ static void process_data_packet(
     resolve_scope_range(config, &ymin, &ymax);
 
     STREAM_TIME_BUFFER *stream = &graph->scope_streams[packet->data.stream_id];
+    bool already_reported = stream->unsupported;
     if (!ensure_scope_buffer(stream, config->win_size, packet->data.sample_rate, ymin, ymax)) {
+        if (already_reported) {
+            return;
+        }
         SDL_Log(
             "[watch-viewer] graph %u stream %u buffer initialization failed "
             "(window %.6g s, sample rate %.6g Hz)",
@@ -2462,11 +2535,18 @@ static void process_spectral_packet(
         return;
     }
 
+    bool already_reported = stream->unsupported;
     if (!ensure_spectral_stream(graph, stream, &packet->data)) {
+        if (already_reported) {
+            return;
+        }
         SDL_Log(
-            "[watch-viewer] graph %u stream %u spectral buffer initialization failed",
+            "[watch-viewer] graph %u stream %u spectral buffer initialization failed "
+            "(%u bins, %.6g s of history)",
             packet->data.graph_id,
-            packet->data.stream_id);
+            packet->data.stream_id,
+            packet->data.total_bins,
+            (double) graph->config.settings.spectral.history_seconds);
         return;
     }
 
@@ -2499,6 +2579,11 @@ static void process_spectral_packet(
             config,
             stream,
             graph->config.theme)) {
+        /*
+         * The texture is unusable from here on: reject the stream so that the
+         * next frames neither retry the update nor repeat the diagnostic.
+         */
+        reject_spectral_stream(stream, &packet->data);
         SDL_Log(
             "[watch-viewer] graph %u stream %u spectrogram history update failed",
             packet->data.graph_id,
@@ -2506,9 +2591,22 @@ static void process_spectral_packet(
     }
 }
 
+static bool reject_ftable_stream(STREAM_FTABLE_BUFFER *stream, const WATCH_MSG_FTABLE_DATA *data) {
+    clear_ftable_stream(stream);
+    stream->transfer_id = data->transfer_id;
+    stream->total_samples = data->total_samples;
+    stream->unsupported = true;
+    return false;
+}
+
 static bool ensure_ftable_stream(STREAM_FTABLE_BUFFER *stream, const WATCH_MSG_FTABLE_DATA *data) {
     if (stream->samples != NULL && stream->transfer_id == data->transfer_id && stream->total_samples == data->total_samples) {
         return true;
+    }
+    if (stream->unsupported
+        && stream->transfer_id == data->transfer_id
+        && stream->total_samples == data->total_samples) {
+        return false;
     }
 
     clear_ftable_stream(stream);
@@ -2516,8 +2614,7 @@ static bool ensure_ftable_stream(STREAM_FTABLE_BUFFER *stream, const WATCH_MSG_F
     stream->total_chunks = (data->total_samples + MAX_STREAM_SAMPLES - 1U) / MAX_STREAM_SAMPLES;
     stream->received_chunks = calloc(stream->total_chunks, sizeof(uint8_t));
     if (stream->samples == NULL || stream->received_chunks == NULL) {
-        clear_ftable_stream(stream);
-        return false;
+        return reject_ftable_stream(stream, data);
     }
 
     stream->transfer_id = data->transfer_id;
@@ -2575,7 +2672,11 @@ static void process_point_packet(
     }
 
     STREAM_POINT_BUFFER *stream = &graph->point_streams[packet->data.stream_id];
+    bool already_reported = stream->unsupported;
     if (!ensure_point_buffer(stream, packet->data.sample_rate)) {
+        if (already_reported) {
+            return;
+        }
         SDL_Log(
             "[watch-viewer] graph %u stream %u point buffer initialization failed "
             "(sample rate %.6g Hz)",
@@ -2619,7 +2720,11 @@ static void process_ftable_packet(
         && stream->total_samples == packet->data.total_samples) {
         return;
     }
+    bool already_reported = stream->unsupported;
     if (!ensure_ftable_stream(stream, &packet->data)) {
+        if (already_reported) {
+            return;
+        }
         SDL_Log(
             "[watch-viewer] graph %u stream %u ftable buffer allocation failed",
             packet->data.graph_id,

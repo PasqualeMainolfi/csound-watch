@@ -43,8 +43,16 @@ static void try_launch_viewer(WATCH_MANAGER *manager, uint64_t now_ms) {
 
     manager->viewer_last_launch_ms = now_ms;
     int32_t error_code = watch_process_launch_viewer();
-    if (error_code != 0) {
+    /*
+     * The launch is retried every two seconds for as long as a graph stays
+     * unacknowledged, so a viewer that cannot be found at all would repeat the
+     * same line for the whole performance. Report a given error only once.
+     */
+    if (error_code != 0 && error_code != manager->viewer_last_launch_error) {
+        manager->viewer_last_launch_error = error_code;
         manager->csound->ErrorMsg(manager->csound, "[watch] could not launch watch_viewer (error %d)\n", error_code);
+    } else if (error_code == 0) {
+        manager->viewer_last_launch_error = 0;
     }
 }
 
@@ -456,6 +464,7 @@ static WATCH_MANAGER *get_manager(CSOUND *csound) {
     manager->sender_thread = NULL;
     manager->viewer_probe_started_ms = UINT64_MAX;
     manager->viewer_last_launch_ms = UINT64_MAX;
+    manager->viewer_last_launch_error = 0;
     atomic_init(&manager->running, false);
 
     manager->registry_mutex = csound->Create_Mutex(0);

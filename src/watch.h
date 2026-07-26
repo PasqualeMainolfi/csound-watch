@@ -24,10 +24,8 @@
 #define WATCH_SESSION_CLOSE_REPETITIONS 3U
 
 
-// TODO: add signal label non-optional
 // CHECK: maybe min/max auto is a wrong idea cause min/max is local
 // add log spaced freqs in spctrum e spectrogram
-// add watchpoint -> plane
 // add watchchannel
 
 
@@ -88,6 +86,7 @@ typedef struct {
 
     uint64_t viewer_probe_started_ms;
     uint64_t viewer_last_launch_ms;
+    int32_t viewer_last_launch_error;
 } WATCH_MANAGER;
 
 typedef struct {
