@@ -4,7 +4,8 @@
 
 **watch** is a Csound 7 plugin for real-time signal visualization. Graphs are
 declared with an init-time opcode and populated with one or more signals through
-`watchadd`.
+`watchadd`. A meter is the exception: it is fed by a single array of levels, so
+`watchmeter` owns its window and needs no `watchadd`.
 
 The current implementation provides:
 
@@ -14,6 +15,7 @@ The current implementation provides:
 * spectrograms from non-sliding `f`-signals;
 * static plots of complete function tables;
 * moving points on a fixed plane from k-rate coordinate pairs;
+* bar meters from k-rate arrays of levels, with peak hold;
 * selectable light and dark graph themes.
 
 ## Architecture
@@ -25,7 +27,9 @@ During performance, `watchadd` copies audio samples, control values, or spectral
 bins into a bounded, preallocated ring buffer. Control values are accumulated
 into 256-sample packets, with the final residual packet published when the
 attaching instrument instance ends. Point streams publish once per viewer frame
-instead, because the eye compares a moving point against the present. A
+instead, because the eye compares a moving point against the present. A meter
+packet carries a single frame, so `watchmeter` reduces the control rate itself:
+it keeps the loudest value of each `ceil(kr / 60)` cycles and publishes that. A
 dedicated sender thread reads the buffer and sends small binary packets over UDP
 to `127.0.0.1:48120`. The viewer receives the packets, reconstructs
 each signal window or spectral frame, and renders it in a separate process.
@@ -36,7 +40,10 @@ blocking audio performance.
 
 The viewer acknowledges each graph configuration before the sender begins
 streaming its data. Configuration packets are retried until that acknowledgement
-arrives.
+arrives, including for a graph whose note has already ended: a table plotted by
+a note shorter than the viewer takes to start still appears. The only graph that
+stops being retried is one replaced by a `reinit`, which has nothing left to
+show.
 
 Function tables use a finite-transfer path rather than the performance ring
 buffer. `watchtable` captures a snapshot at init time, and the sender divides it
@@ -67,7 +74,21 @@ numeric value.
 
 Closing a graph window manually removes that graph from the viewer. Closing the
 last window manually exits the viewer immediately. When a Csound session
-terminates, the plugin sends a session-close message: only windows belonging to
+A window outlives the note that created it: the graph is dropped when its
+instrument instance ends, but what it shows stays readable until the session
+closes. A graph replaced by a `reinit` is the exception, since the instrument
+goes on with a new graph and the previous window no longer stands for anything:
+that one is closed.
+
+Reinitializing a graph opcode is handled, but it is not a good way to use one.
+Each pass discards a window and opens another, and a window carries an
+operating-system window, a renderer and its font textures: building and tearing
+that down costs far more than anything else the viewer does. At twenty
+reinitializations per second the viewer takes around 59% of a CPU core, against
+about 2% in normal use, and closing lags behind opening. Graphs are meant to be
+created once, outside reinit blocks, and fed changing signals.
+
+When a Csound session terminates, the plugin sends a session-close message: only windows belonging to
 that session are removed. If no windows remain, the viewer waits 500 ms before
 exiting. A new graph arriving during that interval cancels the shutdown.
 
@@ -81,6 +102,7 @@ exiting. A new graph arriving during that interval cancels the shutdown.
 | [`watchspectrogram`](watchspectrogram.md) | Create a scrolling spectrogram |
 | [`watchtable`](watchtable.md) | Plot a complete function table |
 | [`watchpoint`](watchpoint.md) | Create a fixed plane for moving points |
+| [`watchmeter`](watchmeter.md) | Display an array of levels as a bar meter |
 | [`watchtheme`](watchtheme.md) | Select a graph's light or dark theme |
 | [`watchadd`](watchadd.md) | Attach a signal or a coordinate pair to a graph |
 
@@ -106,6 +128,15 @@ exiting. A new graph arriving during that interval cancels the shutdown.
 * A point graph draws a fixed plane: the axes never rescale to the incoming
   coordinates, the plot area is kept square so that circular paths are not
   drawn as ellipses, and each point keeps a trail of about 100 ms.
+* A meter graph draws one bar per channel, from 1 through 32, and its vertical
+  range never rescales either. It continues one grid division above the declared
+  maximum as headroom, so a level going over remains visible; past that it is
+  clamped. The levels are plotted in the unit they arrive in, since a meter
+  displays a measurement made by the orchestra rather than making one.
+* A graph opcode inside a reinit block replaces its graph on every pass. The
+  previous graph is dropped and its window closed, so nothing accumulates, but
+  the cost of opening and closing windows makes this an expensive way to work:
+  create the graph once and let the signal change.
 * Communication is local UDP. It is intended for visualization, not lossless
   recording.
 

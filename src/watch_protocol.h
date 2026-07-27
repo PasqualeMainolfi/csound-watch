@@ -7,11 +7,12 @@
 #define MAX_POINT_SAMPLES (MAX_STREAM_SAMPLES / 2U)
 #define MAX_SPECTRAL_BINS 256
 #define MAX_STREAMS 64
+#define MAX_METER_CHANNELS 32U
 #define MAX_TITLE_SIZE 384
 #define MAX_FTABLE_SAMPLES (1U << 30)
 #define MAX_GRID_TICKS 256U
 #define WATCH_VIEWER_REFRESH_HZ 60U
-#define PROT_VERSION 4
+#define PROT_VERSION 6
 #define WATCH_MAGIC 0x57415448
 // local address
 #define WATCH_VIEWER_ADDRESS "127.0.0.1"
@@ -25,7 +26,8 @@ enum {
     WATCH_DOMAIN_CONTROL      = 2U,
     WATCH_DOMAIN_SPECTROGRAM  = 3U,
     WATCH_DOMAIN_FTABLE       = 4U,
-    WATCH_DOMAIN_POINT        = 5U
+    WATCH_DOMAIN_POINT        = 5U,
+    WATCH_DOMAIN_METER        = 6U,
 };
 
 typedef uint32_t WATCH_SPECTRAL_FORMAT;
@@ -35,6 +37,7 @@ enum {
 };
 
 typedef uint32_t WATCH_SPECTRAL_SCALE;
+typedef WATCH_SPECTRAL_SCALE WATCH_METER_SCALE;
 
 enum {
     WATCH_SCALE_LINEAR_GAIN  = 0U,
@@ -56,7 +59,9 @@ typedef enum {
     SPECTRAL_DATA,
     SESSION_CLOSE,
     FTABLE_DATA,
-    POINT_DATA
+    POINT_DATA,
+    METER_DATA,
+    GRAPH_CLOSE
 } MSG_TYPE;
 
 typedef struct {
@@ -100,6 +105,13 @@ typedef struct {
 } WATCH_MSG_FTABLE_DATA;
 
 typedef struct {
+    uint32_t graph_id;
+    uint32_t stream_id;
+    uint32_t channel_count;
+    float levels[MAX_METER_CHANNELS];
+} WATCH_MSG_METER_DATA;
+
+typedef struct {
     int32_t is_min_auto;
     int32_t is_max_auto;
     float min;
@@ -132,11 +144,19 @@ typedef struct {
     WATCH_RANGE yrange;
 } WATCH_MSG_POINT_CONFIG;
 
+typedef struct {
+    uint32_t nchnls;
+    uint32_t nyticks;
+    WATCH_METER_SCALE scale;
+    WATCH_RANGE yrange;
+} WATCH_MSG_METER_CONFIG;
+
 typedef union {
     WATCH_MSG_TIME_CONFIG time;
     WATCH_MSG_SPECTRAL_CONFIG spectral;
     WATCH_MSG_FTABLE_CONFIG ftable;
     WATCH_MSG_POINT_CONFIG point;
+    WATCH_MSG_METER_CONFIG meter;
 } WATCH_MSG_GRAPH_SETTINGS;
 
 typedef struct {
@@ -155,6 +175,15 @@ typedef struct {
     uint32_t reserved;
 } WATCH_MSG_SESSION_CLOSE;
 
+/*
+ * A graph can end before the session that owns it: an instrument reinitialized
+ * mid note replaces its graph, and the window of the previous one no longer
+ * stands for anything.
+ */
+typedef struct {
+    uint32_t graph_id;
+} WATCH_MSG_GRAPH_CLOSE;
+
 typedef struct {
     WATCH_MSG_HEADER header;
     WATCH_MSG_DATA data;
@@ -172,6 +201,11 @@ typedef struct {
 
 typedef struct {
     WATCH_MSG_HEADER header;
+    WATCH_MSG_METER_DATA data;
+} WATCH_METER_DATA_PACKET;
+
+typedef struct {
+    WATCH_MSG_HEADER header;
     WATCH_MSG_CONFIG config;
 } WATCH_CONFIG_PACKET;
 
@@ -184,5 +218,10 @@ typedef struct {
     WATCH_MSG_HEADER header;
     WATCH_MSG_SESSION_CLOSE close;
 } WATCH_SESSION_CLOSE_PACKET;
+
+typedef struct {
+    WATCH_MSG_HEADER header;
+    WATCH_MSG_GRAPH_CLOSE close;
+} WATCH_GRAPH_CLOSE_PACKET;
 
 #endif

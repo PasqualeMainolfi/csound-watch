@@ -22,6 +22,7 @@
 #define WATCH_VIEWER_PROBE_DELAY_MS 150U
 #define WATCH_VIEWER_RELAUNCH_DELAY_MS 2000U
 #define WATCH_SESSION_CLOSE_REPETITIONS 3U
+#define WATCH_GRAPH_CLOSE_REPETITIONS 3U
 
 
 // CHECK: maybe min/max auto is a wrong idea cause min/max is local
@@ -42,6 +43,7 @@ typedef union {
     WATCH_SPECTRAL_DATA_PACKET spectral;
     WATCH_FTABLE_DATA_PACKET ftable;
     WATCH_DATA_PACKET point;
+    WATCH_METER_DATA_PACKET meter;
 } WATCH_STREAM_PACKET;
 
 typedef struct {
@@ -67,6 +69,13 @@ typedef struct {
 typedef struct {
     bool is_config_acked;
     bool destroy_requested;
+    /*
+     * A graph ends with the note that created it, but its window outlives it:
+     * a table plotted by a short note stays on screen. Only a graph replaced
+     * mid note, by a reinit, asks for its window to go with it.
+     */
+    bool close_window_requested;
+    bool close_window_sent;
     uint64_t last_config_send_time;
     WATCH_CONFIG_PACKET data_config;
     WATCH_STREAM **streams;
@@ -209,23 +218,29 @@ typedef struct {
     WATCH_STREAM *stream;
 } WATCH_ADD_POINT;
 
+/*
+ * A meter owns its window and its stream: one opcode, no watchadd. The bars
+ * cannot be fed from more than one place - they are levels, not traces to be
+ * overlaid - and the length of the array is the number of channels, so nothing
+ * has to be declared twice and nothing can disagree.
+ */
 typedef struct {
     OPDS h;
     // outputs
     MYFLT *handle;
     // inputs
-    MYFLT *nchnls;
+    ARRAYDAT *channels; // k-rate levels, already in the unit of the graph
+    MYFLT *min_value;
     MYFLT *max_value;
-    MYFLT *scale; // linear or db
+    MYFLT *scale; // linear gain or decibel
     STRINGDAT *title;
-} WATCH_CREATE_METER;
-
-typedef struct {
-    OPDS h;
-    // inputs
-    MYFLT *handle;
-    ARRAYDAT *channels; // k-gains
-} WATCH_ADD_METER;
+    // private
+    WATCH_STREAM *stream;
+    float peak[MAX_METER_CHANNELS];
+    uint32_t nchnls;
+    uint32_t frames;
+    uint32_t frames_per_packet;
+} WATCH_METER;
 
 
 // INTERFACE
@@ -236,7 +251,7 @@ int32_t watch_create_spectrum(CSOUND *csound, WATCH_CREATE_SPECTRAL *p);       /
 int32_t watch_create_spectrogram(CSOUND *csound, WATCH_CREATE_SPECTROGRAM *p); // i-time
 int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p);                         // i-time
 int32_t watch_create_point(CSOUND *csound, WATCH_CREATE_POINT *p);             // i-time
-int32_t watch_create_meter(CSOUND *csound, WATCH_CREATE_METER *p);             // i-time
+int32_t watch_meter_init(CSOUND *csound, WATCH_METER *p);                      // i-time
 int32_t watch_theme(CSOUND *csound, WATCH_THEME *p);                           // i-time
 
 
@@ -244,7 +259,7 @@ int32_t watch_add_a(CSOUND *csound, WATCH_ADD_TIME *p);     // k-time
 int32_t watch_add_k(CSOUND *csound, WATCH_ADD_TIME *p);     // k-time
 int32_t watch_add_f(CSOUND *csound, WATCH_ADD_SPECTRAL *p); // k-time
 int32_t watch_add_p(CSOUND *csound, WATCH_ADD_POINT *p);    // k-time
-int32_t watch_add_ch(CSOUND *csound, WATCH_ADD_METER *p);   // k-time
+int32_t watch_meter(CSOUND *csound, WATCH_METER *p);        // k-time
 
 
 #endif

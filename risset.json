@@ -8,6 +8,8 @@
     "watchcontrol",
     "watchspectrum",
     "watchspectrogram",
+    "watchpoint",
+    "watchmeter",
     "watchadd",
     "watchtheme"
   ],

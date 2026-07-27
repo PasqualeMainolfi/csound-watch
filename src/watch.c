@@ -23,6 +23,10 @@ _Static_assert(
     "ftable-data packet header must be contiguous with its payload"
 );
 _Static_assert(
+    offsetof(WATCH_METER_DATA_PACKET, data) == sizeof(WATCH_MSG_HEADER),
+    "meter-data packet header must be contiguous with its payload"
+);
+_Static_assert(
     offsetof(WATCH_SESSION_CLOSE_PACKET, close) == sizeof(WATCH_MSG_HEADER),
     "session-close packet header must be contiguous with its payload"
 );
@@ -104,6 +108,35 @@ static WATCH_GRAPH *find_graph(WATCH_MANAGER *manager, uint32_t handle) {
     return NULL;
 }
 
+/*
+ * The graph is dropped by the sender thread once every stream has been released
+ * by its own opcode instance and drained. Its window is asked to go only when
+ * the graph was replaced rather than merely finished: a window that outlives
+ * its note can still be read, one that outlives a reinit shows nothing.
+ */
+static void request_graph_destroy(CSOUND *csound, uint32_t graph_id, bool close_window) {
+    if (graph_id == INVALID_HANDLE) {
+        return;
+    }
+
+    WATCH_MANAGER *manager = csound->QueryGlobalVariable(csound, REGISTRY_NAME);
+    if (manager == NULL) {
+        return;
+    }
+
+    csound->LockMutex(manager->registry_mutex);
+    WATCH_GRAPH *graph = find_graph(manager, graph_id);
+    if (graph != NULL) {
+        graph->destroy_requested = true;
+        if (close_window) {
+            graph->close_window_requested = true;
+        }
+    }
+    csound->UnlockMutex(manager->registry_mutex);
+}
+
+static void release_stream(CSOUND *csound, WATCH_STREAM **stream_ref);
+
 static watch_socket_t create_socket_udp(CSOUND *csound) {
     watch_socket_t socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_fd == WATCH_INVALID_SOCKET) {
@@ -156,6 +189,26 @@ static void send_session_close(WATCH_MANAGER *manager) {
 
     uint32_t packet_size = (uint32_t) offsetof(WATCH_SESSION_CLOSE_PACKET, close) + (uint32_t) sizeof(WATCH_MSG_SESSION_CLOSE);
     for (uint32_t attempt = 0U; attempt < WATCH_SESSION_CLOSE_REPETITIONS; attempt++) {
+        (void) send_packet(manager, &packet, packet_size);
+    }
+}
+
+/*
+ * Sent when a graph is dropped while the session goes on, so that its window
+ * does not outlive what it was showing. Repeated like the session close: the
+ * transport is unreliable and there is nothing left to retry it later.
+ */
+static void send_graph_close(WATCH_MANAGER *manager, uint32_t graph_id) {
+    WATCH_GRAPH_CLOSE_PACKET packet = {0};
+    packet.header.magic = WATCH_MAGIC;
+    packet.header.version = PROT_VERSION;
+    packet.header.type = GRAPH_CLOSE;
+    packet.header.sequence = manager->csound->GetCurrentTimeSamples(manager->csound);
+    packet.header.payload_size = sizeof(WATCH_MSG_GRAPH_CLOSE);
+    packet.close.graph_id = graph_id;
+
+    uint32_t packet_size = (uint32_t) offsetof(WATCH_GRAPH_CLOSE_PACKET, close) + (uint32_t) sizeof(WATCH_MSG_GRAPH_CLOSE);
+    for (uint32_t attempt = 0U; attempt < WATCH_GRAPH_CLOSE_REPETITIONS; attempt++) {
         (void) send_packet(manager, &packet, packet_size);
     }
 }
@@ -218,6 +271,9 @@ static void send_stream_packets(WATCH_MANAGER *manager, WATCH_STREAM *stream) {
             case DATA:
             case POINT_DATA:
                 max_payload_size = sizeof(WATCH_MSG_DATA);
+                break;
+            case METER_DATA:
+                max_payload_size = sizeof(WATCH_MSG_METER_DATA);
                 break;
             case SPECTRAL_DATA:
                 max_payload_size = sizeof(WATCH_MSG_SPECTRAL_DATA);
@@ -314,12 +370,12 @@ static bool graph_has_streams(const WATCH_GRAPH *graph) {
  * later instrument instances, and keeping the stream alive until its owner has
  * deinitialized stops the graph from being freed under a running watchadd.
  */
-static void release_finished_streams(CSOUND *csound, WATCH_GRAPH *graph) {
+static void release_finished_streams(CSOUND *csound, WATCH_GRAPH *graph, bool drain_required) {
     for (uint32_t i = 0U; i < MAX_STREAMS; i++) {
         WATCH_STREAM *stream = graph->streams[i];
         if (stream == NULL
             || !stream->release_requested
-            || !stream_transfer_complete(stream)) {
+            || (drain_required && !stream_transfer_complete(stream))) {
             continue;
         }
 
@@ -353,7 +409,37 @@ static uintptr_t sender_thread_main(void *user_data) {
                 continue;
             }
 
-            if (!graph->is_config_acked) {
+            /*
+             * A graph replaced by a reinit before the viewer ever answered is
+             * abandoned: nothing was sent for it and nothing will be, so there
+             * is no window to close, no queue to drain, and no reason to keep
+             * asking the viewer to open a window for something that is gone.
+             * A graph that merely outlived its note is not abandoned - its
+             * configuration keeps being retried until the viewer answers, which
+             * is what lets a table plotted by a very short note still appear.
+             */
+            bool abandoned = !graph->is_config_acked && graph->close_window_requested;
+
+            if (graph->is_config_acked) {
+                for (uint32_t stream_index = 0; stream_index < MAX_STREAMS; stream_index++) {
+                    WATCH_STREAM *stream = graph->streams[stream_index];
+                    if (stream != NULL) {
+                        send_stream_packets(manager, stream);
+                        send_ftable_packets(manager, stream);
+                    }
+                }
+
+                /*
+                 * The window of a replaced graph goes now rather than when the
+                 * graph itself is freed: what is still queued for it would be
+                 * drawn in a window that already means nothing, and waiting for
+                 * that queue lets the windows of a fast reinit pile up.
+                 */
+                if (graph->close_window_requested && !graph->close_window_sent) {
+                    send_graph_close(manager, graph->data_config.config.graph_id);
+                    graph->close_window_sent = true;
+                }
+            } else if (!abandoned) {
                 has_unacked_graph = true;
                 if (graph->last_config_send_time == UINT64_MAX || now_ms - graph->last_config_send_time >= WATCH_CONFIG_RETRY_MS) {
                     uint32_t packet_size = (uint32_t) offsetof(WATCH_CONFIG_PACKET, config) + graph->data_config.header.payload_size;
@@ -364,14 +450,7 @@ static uintptr_t sender_thread_main(void *user_data) {
                 continue;
             }
 
-            for (uint32_t stream_index = 0; stream_index < MAX_STREAMS; stream_index++) {
-                WATCH_STREAM *stream = graph->streams[stream_index];
-                if (stream != NULL) {
-                    send_stream_packets(manager, stream);
-                    send_ftable_packets(manager, stream);
-                }
-            }
-            release_finished_streams(csound, graph);
+            release_finished_streams(csound, graph, !abandoned);
 
             if (graph->destroy_requested
                 && !graph_has_streams(graph)) {
@@ -646,7 +725,15 @@ static int32_t create_graph(
     const STRINGDAT *title,
     WATCH_GRAPH_THEME theme_id
 ) {
+    /*
+     * A reinit runs the init pass again inside the same note. Every deinit
+     * clears its handle, so a live one here can only have been left by an
+     * earlier pass of this same note: that graph is dropped now, otherwise it
+     * would hold a registry slot until the end of the session with nobody left
+     * to close it.
+     */
     if (handle != NULL) {
+        request_graph_destroy(csound, (uint32_t) *handle, true);
         *handle = (MYFLT) INVALID_HANDLE;
     }
 
@@ -697,25 +784,7 @@ static int32_t create_graph(
 }
 
 static int32_t watch_deinit(CSOUND *csound, WATCH_CREATE_TIME *p) {
-    uint32_t graph_id = (uint32_t) *p->handle;
-    if (graph_id == INVALID_HANDLE) {
-        return OK;
-    }
-
-    WATCH_MANAGER *manager = csound->QueryGlobalVariable(csound, REGISTRY_NAME);
-    if (manager != NULL) {
-        csound->LockMutex(manager->registry_mutex);
-        WATCH_GRAPH *graph = find_graph(manager, graph_id);
-        if (graph != NULL) {
-            /*
-             * The graph is dropped by the sender thread once every stream has
-             * been released by its own watchadd instance and drained.
-             */
-            graph->destroy_requested = true;
-        }
-        csound->UnlockMutex(manager->registry_mutex);
-    }
-
+    request_graph_destroy(csound, (uint32_t) *p->handle, false);
     *p->handle = INVALID_HANDLE;
     return OK;
 }
@@ -745,8 +814,6 @@ static int32_t create_time_helper(CSOUND *csound, WATCH_CREATE_TIME *p, WATCH_MS
 }
 
 int32_t watch_create_scope(CSOUND *csound, WATCH_CREATE_TIME *p) {
-    *p->handle = (MYFLT) INVALID_HANDLE;
-
     if (p->win_size == NULL || !isfinite((double) *p->win_size) || *p->win_size <= FL(0.0)) {
         return csound->InitError(csound, "[watch] window size must be greater than zero");
     }
@@ -834,7 +901,6 @@ int32_t watch_create_spectrum(CSOUND *csound, WATCH_CREATE_SPECTRAL *p) {
 }
 
 int32_t watch_create_spectrogram(CSOUND *csound, WATCH_CREATE_SPECTROGRAM *p) {
-    *p->handle = (MYFLT) INVALID_HANDLE;
     if (p->history_seconds == NULL
         || !isfinite((double) *p->history_seconds)
         || *p->history_seconds <= FL(0.0)
@@ -868,7 +934,8 @@ static int32_t create_stream(
     WATCH_STREAM **result,
     uint32_t float_per_sample
 ) {
-    *result = NULL;
+    // a reinit arrives here with the stream of the previous pass still attached
+    release_stream(csound, result);
     WATCH_MANAGER *manager = csound->QueryGlobalVariable(csound, REGISTRY_NAME);
     if (manager == NULL) {
         return csound->InitError(csound, "[watch] graph manager not found");
@@ -924,7 +991,10 @@ static int32_t create_stream(
      */
     uint32_t max_samples = (uint32_t) MAX_STREAM_SAMPLES / float_per_sample;
     s->publish_threshold = max_samples;
-    if (domain == WATCH_DOMAIN_POINT) {
+    if (domain == WATCH_DOMAIN_METER) {
+        // a meter packet carries one frame; watch_meter publishes it itself
+        s->publish_threshold = 1U;
+    } else if (domain == WATCH_DOMAIN_POINT) {
         double frame_samples = ceil((double) sample_rate / (double) WATCH_VIEWER_REFRESH_HZ);
         if (frame_samples >= 1.0 && frame_samples < (double) max_samples) {
             s->publish_threshold = (uint32_t) frame_samples;
@@ -969,6 +1039,20 @@ static void publish_time_packet(WATCH_STREAM *stream, unsigned next_write) {
     packet->data.sample_count = pending;
     packet->header.payload_size = (uint32_t) offsetof(WATCH_MSG_DATA, samples) + pending * stream->float_per_sample * (uint32_t) sizeof(float);
     atomic_store_explicit(&stream->pending_time_samples, 0U, memory_order_relaxed);
+    atomic_store_explicit(&stream->write_pos, next_write, memory_order_release);
+}
+
+/*
+ * A meter packet holds one frame, so it has no sample count to close: only the
+ * channel count and the payload size, which the levels array does not imply
+ * because it is sent truncated to the channels in use.
+ */
+static void publish_meter_packet(WATCH_STREAM *stream, unsigned next_write, uint32_t nchnls) {
+    unsigned write_pos = atomic_load_explicit(&stream->write_pos, memory_order_relaxed);
+    WATCH_METER_DATA_PACKET *packet = &stream->slots[write_pos].meter;
+    packet->data.channel_count = nchnls;
+    packet->header.payload_size =
+        (uint32_t) offsetof(WATCH_MSG_METER_DATA, levels) + nchnls * (uint32_t) sizeof(float);
     atomic_store_explicit(&stream->write_pos, next_write, memory_order_release);
 }
 
@@ -1182,26 +1266,19 @@ int32_t watch_add_f(CSOUND *csound, WATCH_ADD_SPECTRAL *p) {
 }
 
 
-static int32_t watch_ftable_deinit(CSOUND *csound, WATCH_FTABLE *p) {
-    uint32_t graph_id = (uint32_t) p->graph_id;
-    if (graph_id == INVALID_HANDLE) {
+static int32_t ftable_teardown(CSOUND *csound, WATCH_FTABLE *p, bool close_window) {
+    if (p->graph_id == INVALID_HANDLE) {
         return OK;
     }
 
     release_stream(csound, &p->stream);
-
-    WATCH_MANAGER *manager = csound->QueryGlobalVariable(csound, REGISTRY_NAME);
-    if (manager != NULL) {
-        csound->LockMutex(manager->registry_mutex);
-        WATCH_GRAPH *graph = find_graph(manager, graph_id);
-        if (graph != NULL) {
-            graph->destroy_requested = true;
-        }
-        csound->UnlockMutex(manager->registry_mutex);
-    }
-
+    request_graph_destroy(csound, p->graph_id, close_window);
     p->graph_id = INVALID_HANDLE;
     return OK;
+}
+
+static int32_t watch_ftable_deinit(CSOUND *csound, WATCH_FTABLE *p) {
+    return ftable_teardown(csound, p, false);
 }
 
 static int32_t watch_ftable_title_deinit(CSOUND *csound, WATCH_FTABLE_TITLE *p) {
@@ -1213,8 +1290,12 @@ static int32_t watch_ftable_title_deinit(CSOUND *csound, WATCH_FTABLE_TITLE *p) 
 }
 
 int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p) {
-    p->stream = NULL;
-    p->graph_id = INVALID_HANDLE;
+    /*
+     * A reinit reaches here with the graph of the previous pass still
+     * registered. Its identifier lives in the opcode rather than in an output
+     * cell, so create_graph() cannot see it and the teardown is done here.
+     */
+    ftable_teardown(csound, p, true);
     MYFLT graph_handle = (MYFLT) INVALID_HANDLE;
     FUNC *f = csound->FTFind(csound, p->ftable);
     if (f == NULL || f->ftable == NULL || f->flen <= 0) {
@@ -1295,13 +1376,16 @@ int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p) {
 
 static int32_t watch_ftable_title(CSOUND *csound, WATCH_FTABLE_TITLE *p) {
     // h carries insdshead: the CS_ESR macro used by watch_ftable reads it
+    // the previous pass travels with it, so a reinit is torn down by watch_ftable
     WATCH_FTABLE adapted = {
         .h = p->h,
         .ftable = p->ftable,
         .ymin = p->ymin,
         .ymax = p->ymax,
         .theme = NULL,
-        .title = p->title
+        .title = p->title,
+        .stream = p->stream,
+        .graph_id = p->graph_id
     };
     int32_t result = watch_ftable(csound, &adapted);
     p->stream = adapted.stream;
@@ -1351,8 +1435,6 @@ int32_t watch_theme(CSOUND *csound, WATCH_THEME *p) {
 }
 
 int32_t watch_create_control(CSOUND *csound, WATCH_CREATE_TIME *p) {
-    *p->handle = (MYFLT) INVALID_HANDLE;
-
     if (p->win_size == NULL || !isfinite((double) *p->win_size) || *p->win_size <= FL(0.0)) {
         return csound->InitError(csound, "[watch] window size must be greater than zero");
     }
@@ -1429,8 +1511,6 @@ int32_t watch_add_k(CSOUND *csound, WATCH_ADD_TIME *p) {
 }
 
 int32_t watch_create_point(CSOUND *csound, WATCH_CREATE_POINT *p) {
-    *p->handle = (MYFLT) INVALID_HANDLE;
-
     WATCH_MSG_GRAPH_SETTINGS settings = {0};
     WATCH_MSG_POINT_CONFIG *config = &settings.point;
 
@@ -1517,6 +1597,155 @@ int32_t watch_add_p(CSOUND *csound, WATCH_ADD_POINT *p) {
     }
 }
 
+static int32_t meter_teardown(CSOUND *csound, WATCH_METER *p, bool close_window) {
+    release_stream(csound, &p->stream);
+    request_graph_destroy(csound, (uint32_t) *p->handle, close_window);
+    *p->handle = (MYFLT) INVALID_HANDLE;
+    return OK;
+}
+
+static int32_t watch_meter_deinit(CSOUND *csound, WATCH_METER *p) {
+    return meter_teardown(csound, p, false);
+}
+
+int32_t watch_meter_init(CSOUND *csound, WATCH_METER *p) {
+    /*
+     * A reinit runs this again inside the same note, and this opcode owns both
+     * the graph and the stream: the previous pass is closed here, so that the
+     * early return on a full registry below cannot leave the meter feeding a
+     * graph that is already on its way out.
+     */
+    meter_teardown(csound, p, true);
+
+    // one bar per element: the array is the declaration of the channel count
+    if (p->channels == NULL
+        || p->channels->dimensions != 1
+        || p->channels->sizes == NULL
+        || p->channels->data == NULL
+        || p->channels->sizes[0] < 1
+        || p->channels->sizes[0] > (int32_t) MAX_METER_CHANNELS) {
+        return csound->InitError(csound, "[watch] levels must be a one dimensional array of 1 to %u elements", MAX_METER_CHANNELS);
+    }
+    uint32_t nchnls = (uint32_t) p->channels->sizes[0];
+
+    WATCH_MSG_GRAPH_SETTINGS settings = {0};
+    WATCH_MSG_METER_CONFIG *config = &settings.meter;
+    int32_t result = numeric_range(csound, p->min_value, p->max_value, "y range", -FLT_MAX, FLT_MAX, &config->yrange);
+    if (result != OK) {
+        return result;
+    }
+
+    /*
+     * The levels are plotted as they arrive, so the scale names the unit they
+     * are expressed in rather than a conversion. Power is not one of them: a
+     * meter is read either as a gain or in decibels.
+     */
+    uint32_t scale = (uint32_t) *p->scale;
+    if (*p->scale != (MYFLT) scale
+        || (scale != WATCH_SCALE_LINEAR_GAIN && scale != WATCH_SCALE_DECIBEL)) {
+        return csound->InitError(
+            csound,
+            "[watch] scale must be %u (linear gain) or %u (decibel)",
+            WATCH_SCALE_LINEAR_GAIN,
+            WATCH_SCALE_DECIBEL);
+    }
+
+    config->nchnls = nchnls;
+    config->scale = scale;
+
+    result = create_graph(csound, p->handle, WATCH_DOMAIN_METER, &settings, p->title, WATCH_THEME_LIGHT);
+    if (result != OK) {
+        return result;
+    }
+    if ((uint32_t) *p->handle == INVALID_HANDLE) {
+        // registry full: create_graph has already said so, the meter stays silent
+        return OK;
+    }
+
+    result = create_stream(
+        csound,
+        p->handle,
+        WATCH_DOMAIN_METER,
+        WATCH_DOMAIN_METER,
+        (float) p->h.insdshead->ekr,
+        &p->stream,
+        nchnls
+    );
+    if (result != OK) {
+        watch_meter_deinit(csound, p);
+        return result;
+    }
+
+    // one packet per viewer frame: anything faster is never drawn
+    double frames = ceil((double) p->h.insdshead->ekr / (double) WATCH_VIEWER_REFRESH_HZ);
+    p->frames_per_packet = frames >= 1.0 ? (uint32_t) frames : 1U;
+    p->nchnls = nchnls;
+    p->frames = 0U;
+    for (uint32_t i = 0U; i < nchnls; i++) {
+        p->peak[i] = -FLT_MAX;
+    }
+    return OK;
+}
+
+int32_t watch_meter(CSOUND *csound, WATCH_METER *p) {
+    (void) csound;
+    WATCH_STREAM *stream = p->stream;
+    if (stream == NULL) {
+        return OK;
+    }
+
+    /*
+     * The bars were sized at init from the length of the array. An orchestra
+     * that replaces it with a shorter one would leave this reading past the
+     * end of the new allocation, so the cycle is skipped instead.
+     */
+    uint32_t nchnls = p->nchnls;
+    if (p->channels->data == NULL || (uint32_t) p->channels->sizes[0] < nchnls) {
+        return OK;
+    }
+
+    for (uint32_t i = 0U; i < nchnls; i++) {
+        float level = (float) p->channels->data[i];
+        if (isfinite(level) && level > p->peak[i]) {
+            p->peak[i] = level;
+        }
+    }
+
+    p->frames++;
+    if (p->frames < p->frames_per_packet) {
+        return OK;
+    }
+    p->frames = 0U;
+
+    unsigned write = atomic_load_explicit(&stream->write_pos, memory_order_relaxed);
+    unsigned next_write = (write + 1U) % MAX_QUEUE_SIZE;
+    unsigned read = atomic_load_explicit(&stream->read_pos, memory_order_acquire);
+    if (next_write == read) {
+        // the peaks are kept: the next window carries them, so nothing is lost
+        atomic_fetch_add_explicit(&stream->dropped_samples, 1, memory_order_relaxed);
+        return OK;
+    }
+
+    WATCH_METER_DATA_PACKET *packet = &stream->slots[write].meter;
+    packet->header.magic = WATCH_MAGIC;
+    packet->header.version = PROT_VERSION;
+    packet->header.type = METER_DATA;
+    packet->header.sequence = (int64_t) p->h.insdshead->kcounter;
+
+    packet->data.graph_id = stream->graph_id;
+    packet->data.stream_id = stream->stream_id;
+    for (uint32_t i = 0U; i < nchnls; i++) {
+        packet->data.levels[i] = p->peak[i];
+    }
+
+    publish_meter_packet(stream, next_write, nchnls);
+
+    for (uint32_t i = 0U; i < nchnls; i++) {
+        p->peak[i] = -FLT_MAX;
+    }
+    return OK;
+}
+
 
 
 
@@ -1552,6 +1781,9 @@ static OENTRY localops[] = {
 
     { "watchpoint",           S(WATCH_CREATE_POINT),       0, "i", "iiii",        (SUBR) watch_create_point,       NULL,                  (SUBR) watch_deinit,              NULL, 0 },
     { "watchpoint.s",         S(WATCH_CREATE_POINT),       0, "i", "iiiiS",       (SUBR) watch_create_point,       NULL,                  (SUBR) watch_deinit,              NULL, 0 },
+
+    { "watchmeter",           S(WATCH_METER),              0, "i", "k[]iii",      (SUBR) watch_meter_init,         (SUBR) watch_meter,    (SUBR) watch_meter_deinit,        NULL, 0 },
+    { "watchmeter.s",         S(WATCH_METER),              0, "i", "k[]iiiS",     (SUBR) watch_meter_init,         (SUBR) watch_meter,    (SUBR) watch_meter_deinit,        NULL, 0 },
 
     { "watchadd.a",           S(WATCH_ADD_TIME),           0, "",  "ia",          (SUBR) watch_add_a_init,         (SUBR) watch_add_a,    (SUBR) watch_add_deinit,          NULL, 0 },
     { "watchadd.k",           S(WATCH_ADD_TIME),           0, "",  "ik",          (SUBR) watch_add_k_init,         (SUBR) watch_add_k,    (SUBR) watch_add_deinit,          NULL, 0 },

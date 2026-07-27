@@ -50,6 +50,24 @@
 #define POINT_TRAIL_MIN_ALPHA 40.0f
 #define POINT_HEAD_SIZE 5.0f
 #define POINT_TICKS 8U
+/*
+ * A meter answers "how loud is it now", so the bar carries the level it was
+ * given and nothing else: each packet already holds the loudest value of one
+ * viewer frame, so smoothing it again would only make the bar trail the sound.
+ * The peak mark is what holds, long enough to be read, and then falls towards
+ * the bottom of the axis, which is what silence means in any unit.
+ */
+#define METER_BAR_FILL 0.62f
+#define METER_PEAK_HOLD_SECONDS 1.5f
+#define METER_PEAK_RELEASE_SECONDS 1.0f
+#define METER_PEAK_THICKNESS 3.0f
+#define METER_PEAK_HUE 18.0f
+#define METER_PEAK_LIGHT_MAXIMUM 0.05f
+#define METER_PEAK_DARK_MINIMUM 0.55f
+#define METER_HEADROOM_ALPHA 28U
+#define STREAM_COLOR_LIGHT_MAXIMUM 0.155f
+#define STREAM_COLOR_DARK_MINIMUM 0.30f
+#define METER_DEFAULT_DB_SPAN 60.0f
 #define CONFIG_FAILURE_LOG_INTERVAL_NS 2000000000ULL
 #define AXIS_FONT_SIZE 15.0f
 #define TICK_FONT_SIZE 11.0f
@@ -60,6 +78,7 @@
 #define MAX_NUMBERED_TICK_INTERVALS 10U
 #define TICK_TEXT_SIZE 32U
 
+
 typedef union {
     WATCH_MSG_HEADER header;
     WATCH_CONFIG_PACKET config;
@@ -68,6 +87,8 @@ typedef union {
     WATCH_FTABLE_DATA_PACKET ftable;
     WATCH_ACK_PACKET ack;
     WATCH_SESSION_CLOSE_PACKET close;
+    WATCH_GRAPH_CLOSE_PACKET graph_close;
+    WATCH_METER_DATA_PACKET meter;
 } WATCH_INCOMING_PACKET;
 
 typedef struct {
@@ -92,7 +113,8 @@ typedef uint32_t TICK_VALUE_FORMAT;
 enum {
     TICK_FORMAT_NUMBER = 0U,
     TICK_FORMAT_TIME,
-    TICK_FORMAT_FREQUENCY
+    TICK_FORMAT_FREQUENCY,
+    TICK_FORMAT_CHANNEL
 };
 
 typedef struct {
@@ -186,6 +208,18 @@ typedef struct {
     bool unsupported;
 } STREAM_POINT_BUFFER;
 
+/*
+ * A meter graph shows one bar per channel and no history, so a single buffer
+ * per graph is enough: the levels are indexed by channel, not by stream.
+ */
+typedef struct {
+    float level[MAX_METER_CHANNELS];
+    float peak[MAX_METER_CHANNELS];
+    uint64_t peak_time_ns[MAX_METER_CHANNELS];
+    uint64_t last_frame_ns;
+    bool has_frame;
+} STREAM_METER_BUFFER;
+
 typedef struct {
     bool ready;
     WATCH_MSG_CONFIG config;
@@ -206,6 +240,7 @@ typedef struct {
     STREAM_SPECTRAL_BUFFER *spectral_streams;
     STREAM_FTABLE_BUFFER *ftable_streams;
     STREAM_POINT_BUFFER *point_streams;
+    STREAM_METER_BUFFER *meter_stream;
     double scope_display_end_sample;
     uint64_t scope_last_render_ns;
     bool scope_display_started;
@@ -268,16 +303,11 @@ static SDL_FColor hsv_color(float hue, float saturation, float value) {
 }
 
 static float linear_color_component(float component) {
-    return component <= 0.04045f
-        ? component / 12.92f
-        : powf((component + 0.055f) / 1.055f, 2.4f);
+    return component <= 0.04045f ? component / 12.92f : powf((component + 0.055f) / 1.055f, 2.4f);
 }
 
 static float color_luminance(SDL_FColor color) {
-    return
-        0.2126f * linear_color_component(color.r)
-        + 0.7152f * linear_color_component(color.g)
-        + 0.0722f * linear_color_component(color.b);
+    return 0.2126f * linear_color_component(color.r) + 0.7152f * linear_color_component(color.g) + 0.0722f * linear_color_component(color.b);
 }
 
 static SDL_Color byte_color(SDL_FColor color) {
@@ -290,54 +320,99 @@ static SDL_Color byte_color(SDL_FColor color) {
     return result;
 }
 
+/*
+ * The same hue is darkened until it stands out on the light background and
+ * brightened until it stands out on the dark one, so a color keeps its identity
+ * between themes while staying readable in both. The two limits are arguments
+ * because what a color is drawn against differs: a curve sits on the
+ * background, while a peak mark sits on top of a bar and has to separate itself
+ * from that as well.
+ */
+static void themed_color_pair(
+    SDL_FColor base,
+    float light_maximum,
+    float dark_minimum,
+    SDL_Color *light_color,
+    SDL_Color *dark_color
+) {
+    SDL_FColor light = base;
+    SDL_FColor dark = base;
+
+    while (color_luminance(light) > light_maximum) {
+        light.r *= 0.94f;
+        light.g *= 0.94f;
+        light.b *= 0.94f;
+    }
+    while (color_luminance(dark) < dark_minimum) {
+        dark.r += (1.0f - dark.r) * 0.08f;
+        dark.g += (1.0f - dark.g) * 0.08f;
+        dark.b += (1.0f - dark.b) * 0.08f;
+    }
+
+    *light_color = byte_color(light);
+    *dark_color = byte_color(dark);
+}
+
 static void initialize_stream_colors(void) {
     if (stream_colors_ready) {
         return;
     }
 
     for (uint32_t i = 0U; i < MAX_STREAMS; i++) {
-        float hue = fmodf(
-            210.0f + (float) i * 137.507764f,
-            360.0f);
+        float hue = fmodf(210.0f + (float) i * 137.507764f, 360.0f);
         float saturation = 0.68f + 0.08f * (float) (i % 4U);
         float value = 0.86f + 0.04f * (float) ((i / 4U) % 3U);
-        SDL_FColor light = hsv_color(hue, saturation, value);
-        SDL_FColor dark = light;
-
-        while (color_luminance(light) > 0.155f) {
-            light.r *= 0.94f;
-            light.g *= 0.94f;
-            light.b *= 0.94f;
-        }
-        while (color_luminance(dark) < 0.30f) {
-            dark.r += (1.0f - dark.r) * 0.08f;
-            dark.g += (1.0f - dark.g) * 0.08f;
-            dark.b += (1.0f - dark.b) * 0.08f;
-        }
-
-        stream_colors_light[i] = byte_color(light);
-        stream_colors_dark[i] = byte_color(dark);
+        themed_color_pair(
+            hsv_color(hue, saturation, value),
+            STREAM_COLOR_LIGHT_MAXIMUM,
+            STREAM_COLOR_DARK_MINIMUM,
+            &stream_colors_light[i],
+            &stream_colors_dark[i]);
     }
     stream_colors_ready = true;
 }
 
-static void set_stream_draw_color(
-    SDL_Renderer *renderer,
-    WATCH_GRAPH_THEME theme,
-    uint32_t stream_index
-) {
+static void set_stream_draw_color(SDL_Renderer *renderer, WATCH_GRAPH_THEME theme, uint32_t stream_index) {
     initialize_stream_colors();
-    const SDL_Color *palette =
-        theme == WATCH_THEME_DARK
-            ? stream_colors_dark
-            : stream_colors_light;
+    const SDL_Color *palette = theme == WATCH_THEME_DARK ? stream_colors_dark : stream_colors_light;
     SDL_Color color = palette[stream_index % MAX_STREAMS];
-    SDL_SetRenderDrawColor(
-        renderer,
-        color.r,
-        color.g,
-        color.b,
-        color.a);
+    SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
+}
+
+/*
+ * The peak mark rides on the bar it belongs to, and while the signal is rising
+ * the two coincide: a shade of the bar color would be invisible exactly when
+ * the peak is being set. It gets a hue of its own, opposite the bars, which
+ * start at 210 degrees, and a lightness pushed past theirs so that hue is not
+ * the only thing telling them apart.
+ */
+static SDL_Color meter_peak_color(WATCH_GRAPH_THEME theme) {
+    static SDL_Color peak_light;
+    static SDL_Color peak_dark;
+    static bool peak_colors_ready = false;
+
+    if (!peak_colors_ready) {
+        themed_color_pair(
+            hsv_color(METER_PEAK_HUE, 0.92f, 0.95f),
+            METER_PEAK_LIGHT_MAXIMUM,
+            METER_PEAK_DARK_MINIMUM,
+            &peak_light,
+            &peak_dark);
+        peak_colors_ready = true;
+    }
+
+    return theme == WATCH_THEME_DARK ? peak_dark : peak_light;
+}
+
+static void set_meter_peak_color(SDL_Renderer *renderer, WATCH_GRAPH_THEME theme) {
+    SDL_Color color = meter_peak_color(theme);
+    SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
+}
+
+// the same color as the peak, laid under everything as a tint rather than a mark
+static void set_meter_headroom_color(SDL_Renderer *renderer, WATCH_GRAPH_THEME theme) {
+    SDL_Color color = meter_peak_color(theme);
+    SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, METER_HEADROOM_ALPHA);
 }
 
 static float graph_pixel_density(const VIEW_GRAPH *graph);
@@ -420,6 +495,9 @@ static const char *x_axis_label(const WATCH_MSG_CONFIG *config) {
     if (config->domain == WATCH_DOMAIN_POINT) {
         return "x";
     }
+    if (config->domain == WATCH_DOMAIN_METER) {
+        return "Channel";
+    }
     return "Time (s)";
 }
 
@@ -445,6 +523,10 @@ static const char *y_axis_label(const WATCH_MSG_CONFIG *config) {
             return "Value";
         case WATCH_DOMAIN_POINT:
             return "y";
+        case WATCH_DOMAIN_METER:
+            return config->settings.meter.scale == WATCH_SCALE_DECIBEL
+                ? "Level (dB)"
+                : "Gain";
         default:
             return "";
     }
@@ -526,18 +608,8 @@ static bool prepare_axis_labels(VIEW_GRAPH *graph, float density) {
     TEXT_LABEL new_x_label = {0};
     TEXT_LABEL new_y_label = {0};
     bool created =
-        create_text_label(
-            graph->renderer,
-            font,
-            xlabel,
-            graph->config.theme,
-            &new_x_label)
-        && create_text_label(
-            graph->renderer,
-            font,
-            ylabel,
-            graph->config.theme,
-            &new_y_label);
+        create_text_label(graph->renderer, font, xlabel, graph->config.theme, &new_x_label)
+        && create_text_label(graph->renderer, font, ylabel, graph->config.theme, &new_y_label);
     TTF_CloseFont(font);
     SDL_CloseIO(font_stream);
 
@@ -651,12 +723,7 @@ static bool prepare_tick_axis(
 
     char text[TICK_TEXT_SIZE];
     if (!format_tick_value(text, maximum, format)
-        || !create_text_label(
-            renderer,
-            font,
-            text,
-            theme,
-            &entries[entry_index].label)) {
+        || !create_text_label(renderer, font, text, theme, &entries[entry_index].label)) {
         TICK_AXIS_LABELS partial = {
             .entries = entries,
             .count = entry_index,
@@ -671,6 +738,51 @@ static bool prepare_tick_axis(
     axis->entries = entries;
     axis->count = entry_index;
     axis->intervals = intervals;
+    return true;
+}
+
+/*
+ * The channel axis is not a numeric range: its labels are names, one per bar,
+ * and they belong at the centre of the bar rather than on its edge. Two grid
+ * intervals per channel put the odd indices exactly there, so draw_tick_labels()
+ * places them from grid_index/intervals like every other axis. There is no
+ * final entry for the maximum either: a category has no upper bound to print.
+ */
+static bool prepare_channel_tick_axis(
+    SDL_Renderer *renderer,
+    TTF_Font *font,
+    uint32_t nchnls,
+    WATCH_GRAPH_THEME theme,
+    TICK_AXIS_LABELS *axis
+) {
+    if (nchnls == 0U || nchnls > MAX_METER_CHANNELS) {
+        return false;
+    }
+
+    TICK_LABEL_ENTRY *entries = calloc(nchnls, sizeof(*entries));
+    if (entries == NULL) {
+        return false;
+    }
+
+    for (uint32_t i = 0U; i < nchnls; i++) {
+        char text[TICK_TEXT_SIZE];
+        int written = snprintf(text, TICK_TEXT_SIZE, "CH[%u]", i + 1U);
+        bool text_label = create_text_label(renderer, font, text, theme, &entries[i].label);
+        if (written <= 0 || written >= (int) TICK_TEXT_SIZE || !text_label) {
+            TICK_AXIS_LABELS partial = {
+                .entries = entries,
+                .count = i,
+                .intervals = nchnls * 2U
+            };
+            destroy_tick_axis(&partial);
+            return false;
+        }
+        entries[i].grid_index = 2U * i + 1U;
+    }
+
+    axis->entries = entries;
+    axis->count = nchnls;
+    axis->intervals = nchnls * 2U;
     return true;
 }
 
@@ -693,27 +805,14 @@ static bool prepare_tick_labels(
     }
 
     TICK_LABEL_CACHE next = {0};
-    bool created = prepare_tick_axis(
-        graph->renderer,
-        font,
-        x_intervals,
-        xmin,
-        xmax,
-        x_format,
-        graph->config.theme,
-        &next.x);
+    bool channel_tick_axis = prepare_channel_tick_axis(graph->renderer, font, (uint32_t) xmax, graph->config.theme, &next.x);
+    bool tick_axis = prepare_tick_axis(graph->renderer, font, x_intervals, xmin, xmax, x_format, graph->config.theme, &next.x);
+    bool created = x_format == TICK_FORMAT_CHANNEL ? channel_tick_axis : tick_axis;
 
     if (created) {
-        created = prepare_tick_axis(
-            graph->renderer,
-            font,
-            y_intervals,
-            ymin,
-            ymax,
-            y_format,
-            graph->config.theme,
-            &next.y);
+        created = prepare_tick_axis(graph->renderer, font, y_intervals, ymin, ymax, y_format, graph->config.theme, &next.y);
     }
+
     TTF_CloseFont(font);
     SDL_CloseIO(font_stream);
 
@@ -816,22 +915,14 @@ static void draw_axis_labels(VIEW_GRAPH *graph, const PLOT_AREA *plot) {
      * square and the name has to follow its tick labels.
      */
     float y_tick_width = maximum_tick_width(&graph->tick_labels.y);
-    float y_center_x =
-        plot->left - mark_length - tick_gap - y_tick_width - axis_gap - y_height * 0.5f;
+    float y_center_x = plot->left - mark_length - tick_gap - y_tick_width - axis_gap - y_height * 0.5f;
     SDL_FRect y_destination = {
         .x = y_center_x - y_width * 0.5f,
         .y = plot->y_center - y_height * 0.5f,
         .w = y_width,
         .h = y_height
     };
-    SDL_RenderTextureRotated(
-        graph->renderer,
-        graph->y_axis_label.texture,
-        NULL,
-        &y_destination,
-        270.0,
-        NULL,
-        SDL_FLIP_NONE);
+    SDL_RenderTextureRotated(graph->renderer, graph->y_axis_label.texture, NULL, &y_destination, 270.0, NULL, SDL_FLIP_NONE);
 }
 
 static void draw_tick_labels(VIEW_GRAPH *graph, const PLOT_AREA *plot) {
@@ -844,8 +935,13 @@ static void draw_tick_labels(VIEW_GRAPH *graph, const PLOT_AREA *plot) {
     float mark_length = TICK_MARK_LENGTH * density;
     float gap = TICK_LABEL_GAP * density;
 
+    /*
+     * The rightmost label is the one the others must not run into. On a numeric
+     * axis it sits on the right edge, but a channel axis ends half a bar before
+     * it, so its position is taken from the grid like every other label.
+     */
     const TICK_LABEL_ENTRY *last_x = &cache->x.entries[cache->x.count - 1U];
-    float last_x_center = plot->right;
+    float last_x_center = plot->left + ((float) last_x->grid_index / cache->x.intervals) * plot->plot_width;
     float last_x_left = last_x_center - last_x->label.width * 0.5f;
     float previous_right = -INFINITY;
     for (uint32_t i = 0; i < cache->x.count; i++) {
@@ -869,8 +965,7 @@ static void draw_tick_labels(VIEW_GRAPH *graph, const PLOT_AREA *plot) {
         previous_right = right;
     }
 
-    const TICK_LABEL_ENTRY *last_y =
-        &cache->y.entries[cache->y.count - 1U];
+    const TICK_LABEL_ENTRY *last_y = &cache->y.entries[cache->y.count - 1U];
     float last_y_bottom = plot->top + last_y->label.height * 0.5f;
     float previous_top = INFINITY;
     for (uint32_t i = 0; i < cache->y.count; i++) {
@@ -892,6 +987,60 @@ static void draw_tick_labels(VIEW_GRAPH *graph, const PLOT_AREA *plot) {
         };
         SDL_RenderTexture(graph->renderer, entry->label.texture, NULL, &destination);
         previous_top = top;
+    }
+}
+
+/*
+ * Vertical grid lines are left out: a bar already separates itself from its
+ * neighbours, and a line between channels would only compete with it. The tick
+ * marks sit under the centre of each bar, where prepare_channel_tick_axis()
+ * puts the channel names.
+ */
+static void draw_meter(
+    SDL_Renderer *renderer,
+    const PLOT_AREA *p,
+    float density,
+    uint32_t nchnls,
+    int nyticks,
+    WATCH_GRAPH_THEME theme
+) {
+    if (nchnls == 0U || nyticks <= 0) {
+        return;
+    }
+
+    float slot = p->plot_width / (float) nchnls;
+    float ystep = p->plot_heigth / (float) nyticks;
+    float mark_length = TICK_MARK_LENGTH * density;
+
+    /*
+     * The topmost division is the headroom above the declared maximum. Tinting
+     * it says where the range ends without a line that would compete with the
+     * peak marks, and a bar reaching into it is over by an amount that can be
+     * read rather than merely pinned to the top edge.
+     */
+    set_meter_headroom_color(renderer, theme);
+    SDL_FRect headroom = {
+        .x = p->left,
+        .y = p->top,
+        .w = p->plot_width,
+        .h = ystep
+    };
+    SDL_RenderFillRect(renderer, &headroom);
+
+    set_themed_draw_color(renderer, theme, 0U, 25U);
+    for (int i = 1; i < nyticks; i++) {
+        float y = p->top + i * ystep;
+        SDL_RenderLine(renderer, p->left, y, p->right - 1, y);
+    }
+
+    set_themed_draw_color(renderer, theme, 0U, 255U);
+    for (int i = 0; i <= nyticks; i++) {
+        float y = p->top + i * ystep;
+        SDL_RenderLine(renderer, p->left, y, p->left - mark_length, y);
+    }
+    for (uint32_t i = 0U; i < nchnls; i++) {
+        float x = p->left + ((float) i + 0.5f) * slot;
+        SDL_RenderLine(renderer, x, p->bottom, x, p->bottom + mark_length);
     }
 }
 
@@ -1104,6 +1253,14 @@ static void append_point(STREAM_POINT_BUFFER *stream, float x, float y) {
     }
 }
 
+static STREAM_METER_BUFFER *prepare_meter_buffer(void) {
+    return calloc(1, sizeof(STREAM_METER_BUFFER));
+}
+
+static void free_meter_buffer(STREAM_METER_BUFFER *stream) {
+    free(stream);
+}
+
 static uint64_t scope_latency_samples(float sample_rate) {
     double samples = ceil((double) sample_rate * SCOPE_RENDER_LATENCY_MS / 1000.0);
     return samples > 0.0 ? (uint64_t) samples : 0U;
@@ -1211,14 +1368,7 @@ static float scope_sample_y(const PLOT_AREA *plot, const STREAM_TIME_BUFFER *str
     return plot->bottom - normalized * plot->plot_heigth;
 }
 
-static void draw_waveform_line(
-    SDL_Renderer *renderer,
-    float x1,
-    float y1,
-    float x2,
-    float y2,
-    bool supersampled
-) {
+static void draw_waveform_line(SDL_Renderer *renderer, float x1, float y1, float x2, float y2, bool supersampled) {
     float radius = supersampled ? WAVEFORM_LINE_RADIUS : 1.0f;
     SDL_RenderLine(renderer, x1, y1, x2, y2);
     SDL_RenderLine(renderer, x1 - radius, y1, x2 - radius, y2);
@@ -1227,12 +1377,7 @@ static void draw_waveform_line(
     SDL_RenderLine(renderer, x1, y1 + radius, x2, y2 + radius);
 }
 
-static void draw_waveform_point(
-    SDL_Renderer *renderer,
-    float x,
-    float y,
-    bool supersampled
-) {
+static void draw_waveform_point(SDL_Renderer *renderer, float x, float y, bool supersampled) {
     float radius = supersampled ? WAVEFORM_LINE_RADIUS : 1.0f;
     SDL_RenderPoint(renderer, x, y);
     SDL_RenderPoint(renderer, x - radius, y);
@@ -1281,15 +1426,9 @@ static uint32_t scope_buffer_index(const STREAM_TIME_BUFFER *stream, int64_t seq
     return (stream->write_index + stream->capacity - distance) % stream->capacity;
 }
 
-static float scope_display_sample(
-    const STREAM_TIME_BUFFER *stream,
-    uint32_t first_buffer_index,
-    uint32_t display_index
-) {
-    uint32_t source_offset = display_index;
-    return stream->buffer[
-        (first_buffer_index + source_offset) % stream->capacity
-    ];
+static float scope_display_sample(const STREAM_TIME_BUFFER *stream, uint32_t first_buffer_index, uint32_t display_index) {
+    uint32_t index = first_buffer_index + display_index;
+    return stream->buffer[index % stream->capacity];
 }
 
 static bool advance_scope_timeline(VIEW_GRAPH *graph, uint64_t now_ns) {
@@ -1412,9 +1551,7 @@ static void draw_scope_stream(
      * portion filled so far.
      */
     float raster_width = last_x - first_x;
-    uint32_t column_count = raster_width >= 0.0f
-        ? (uint32_t) floorf(raster_width) + 1U
-        : 0U;
+    uint32_t column_count = raster_width >= 0.0f ? (uint32_t) floorf(raster_width) + 1U : 0U;
 
     if (column_count > 0U && (uint64_t) point_count > (uint64_t) column_count * 2U) {
         bool has_previous = false;
@@ -1424,10 +1561,7 @@ static void draw_scope_stream(
             uint32_t first_in_column = (uint32_t) (((uint64_t) column * point_count) / column_count);
             uint32_t end_in_column = (uint32_t) (((uint64_t) (column + 1U) * point_count) / column_count);
 
-            float minimum = scope_display_sample(
-                stream,
-                first_buffer_index,
-                first_in_column);
+            float minimum = scope_display_sample(stream, first_buffer_index, first_in_column);
             float maximum = minimum;
             for (uint32_t i = first_in_column + 1U; i < end_in_column; i++) {
                 float sample = scope_display_sample(stream, first_buffer_index, i);
@@ -1439,45 +1573,33 @@ static void draw_scope_stream(
                 }
             }
 
-            float x = column_count > 1U
-                ? first_x + (float) column * raster_width / (float) (column_count - 1U)
-                : first_x;
+            float fx_col = first_x + (float) column * raster_width / (float) (column_count - 1U);
+            float x = column_count > 1U ? fx_col : first_x;
             float top = scope_sample_y(p, stream, maximum);
             float bottom = scope_sample_y(p, stream, minimum);
-            float first_y = scope_sample_y(
-                p,
-                stream,
-                scope_display_sample(stream, first_buffer_index, first_in_column));
+
+            float display_sample_first = scope_display_sample(stream, first_buffer_index, first_in_column);
+            float first_y = scope_sample_y(p, stream, display_sample_first);
             if (has_previous) {
                 draw_waveform_line(renderer, previous_x, previous_y, x, first_y, supersampled);
             }
             draw_scope_vertical(renderer, x, top, bottom, supersampled);
             previous_x = x;
-            previous_y = scope_sample_y(
-                p,
-                stream,
-                scope_display_sample(stream, first_buffer_index, end_in_column - 1U)
-            );
+            float display_sample_end = scope_display_sample(stream, first_buffer_index, end_in_column - 1U);
+            previous_y = scope_sample_y(p, stream, display_sample_end);
             has_previous = true;
         }
         return;
     }
 
     for (uint32_t i = 0; i < point_count; i++) {
-        float sample = scope_display_sample(
-            stream,
-            first_buffer_index,
-            i);
+        float sample = scope_display_sample(stream, first_buffer_index, i);
         stream->plot_points[i].x = first_x + i * x_step;
         stream->plot_points[i].y = scope_sample_y(p, stream, sample);
     }
 
     if (point_count == 1U) {
-        draw_waveform_point(
-            renderer,
-            stream->plot_points[0].x,
-            stream->plot_points[0].y,
-            supersampled);
+        draw_waveform_point(renderer, stream->plot_points[0].x, stream->plot_points[0].y, supersampled);
     } else {
         draw_scope_polyline(renderer, stream->plot_points, point_count, supersampled);
     }
@@ -1497,6 +1619,10 @@ static bool is_ftable_domain(WATCH_SIGNAL_DOMAIN domain) {
 
 static bool is_point_domain(WATCH_SIGNAL_DOMAIN domain) {
     return domain == WATCH_DOMAIN_POINT;
+}
+
+static bool is_meter_domain(WATCH_SIGNAL_DOMAIN domain) {
+    return domain == WATCH_DOMAIN_METER;
 }
 
 static float spectral_display_value(float power, WATCH_SPECTRAL_SCALE scale) {
@@ -1535,13 +1661,7 @@ static void resolve_spectral_static_range(const WATCH_MSG_SPECTRAL_CONFIG *confi
     }
 }
 
-static void spectral_grayscale(
-    float value,
-    float minimum,
-    float maximum,
-    WATCH_GRAPH_THEME theme,
-    uint8_t rgba[4]
-) {
+static void spectral_grayscale(float value, float minimum, float maximum, WATCH_GRAPH_THEME theme, uint8_t rgba[4]) {
     float normalized = (value - minimum) / (maximum - minimum);
     normalized = fminf(fmaxf(normalized, 0.0f), 1.0f);
     uint8_t light_shade = (uint8_t) lroundf((1.0f - normalized) * 255.0f);
@@ -1552,12 +1672,7 @@ static void spectral_grayscale(
     rgba[3] = 255U;
 }
 
-static SDL_Texture *create_spectrogram_texture(
-    SDL_Renderer *renderer,
-    uint32_t width,
-    uint32_t height,
-    WATCH_GRAPH_THEME theme
-) {
+static SDL_Texture *create_spectrogram_texture(SDL_Renderer *renderer, uint32_t width, uint32_t height, WATCH_GRAPH_THEME theme) {
     if (renderer == NULL
         || width == 0U
         || height == 0U
@@ -1572,19 +1687,13 @@ static SDL_Texture *create_spectrogram_texture(
         return NULL;
     }
 
-    SDL_Texture *texture = SDL_CreateTexture(
-        renderer,
-        SDL_PIXELFORMAT_RGBA32,
-        SDL_TEXTUREACCESS_STREAMING,
-        (int) width,
-        (int) height);
+    SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, (int) width, (int) height);
 
     if (texture == NULL) {
         return NULL;
     }
 
-    if (!SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR)
-        || !SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE)) {
+    if (!SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR) || !SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE)) {
         SDL_DestroyTexture(texture);
         return NULL;
     }
@@ -1603,11 +1712,7 @@ static SDL_Texture *create_spectrogram_texture(
         blank[i + 3U] = 255U;
     }
 
-    bool initialized = SDL_UpdateTexture(
-        texture,
-        NULL,
-        blank,
-        (int) ((size_t) width * 4U));
+    bool initialized = SDL_UpdateTexture(texture, NULL, blank, (int) ((size_t) width * 4U));
 
     free(blank);
     if (!initialized) {
@@ -1618,10 +1723,7 @@ static SDL_Texture *create_spectrogram_texture(
     return texture;
 }
 
-static bool reject_spectral_stream(
-    STREAM_SPECTRAL_BUFFER *stream,
-    const WATCH_MSG_SPECTRAL_DATA *data
-) {
+static bool reject_spectral_stream(STREAM_SPECTRAL_BUFFER *stream, const WATCH_MSG_SPECTRAL_DATA *data) {
     clear_spectral_stream(stream);
     stream->fft_size = data->fft_size;
     stream->hop_size = data->hop_size;
@@ -1631,11 +1733,7 @@ static bool reject_spectral_stream(
     return false;
 }
 
-static bool ensure_spectral_stream(
-    VIEW_GRAPH *graph,
-    STREAM_SPECTRAL_BUFFER *stream,
-    const WATCH_MSG_SPECTRAL_DATA *data
-) {
+static bool ensure_spectral_stream(VIEW_GRAPH *graph, STREAM_SPECTRAL_BUFFER *stream, const WATCH_MSG_SPECTRAL_DATA *data) {
     bool metadata_matches =
         stream->assembly_bins != NULL
         && stream->received_bins != NULL
@@ -1643,6 +1741,7 @@ static bool ensure_spectral_stream(
         && stream->hop_size == data->hop_size
         && stream->sample_rate == data->sample_rate
         && stream->total_bins == data->total_bins;
+
     if (stream->unsupported
         && stream->fft_size == data->fft_size
         && stream->hop_size == data->hop_size
@@ -1690,11 +1789,7 @@ static bool ensure_spectral_stream(
 
     stream->history_capacity = (uint32_t) requested_history;
     stream->color_column = malloc((size_t) data->total_bins * 4U);
-    stream->history_texture = create_spectrogram_texture(
-        graph->renderer,
-        stream->history_capacity,
-        data->total_bins,
-        graph->config.theme);
+    stream->history_texture = create_spectrogram_texture(graph->renderer, stream->history_capacity, data->total_bins, graph->config.theme);
     if (stream->color_column == NULL || stream->history_texture == NULL) {
         return reject_spectral_stream(stream, data);
     }
@@ -1733,6 +1828,7 @@ static void destroy_graph(VIEW_GRAPH *graph) {
     free_spectral_buffers(graph->spectral_streams);
     free_ftable_buffers(graph->ftable_streams);
     free_point_buffers(graph->point_streams);
+    free_meter_buffer(graph->meter_stream);
     destroy_text_label(&graph->x_axis_label);
     destroy_text_label(&graph->y_axis_label);
     destroy_tick_labels(&graph->tick_labels);
@@ -1780,12 +1876,7 @@ static bool ensure_graph_render_target(VIEW_GRAPH *graph) {
         graph->render_target = NULL;
     }
 
-    graph->render_target = SDL_CreateTexture(
-        graph->renderer,
-        SDL_PIXELFORMAT_RGBA8888,
-        SDL_TEXTUREACCESS_TARGET,
-        target_width,
-        target_heigth);
+    graph->render_target = SDL_CreateTexture(graph->renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, target_width, target_heigth);
     if (graph->render_target == NULL) {
         graph->render_target_width = 0;
         graph->render_target_heigth = 0;
@@ -1838,7 +1929,7 @@ static bool validate_config_packet(const WATCH_CONFIG_PACKET *packet, int64_t re
         || packet->header.type != CONFIG
         || packet->header.payload_size != sizeof(WATCH_MSG_CONFIG)
         || packet->config.graph_id == 0U
-        || packet->config.domain > WATCH_DOMAIN_POINT
+        || packet->config.domain > WATCH_DOMAIN_METER
         || packet->config.theme > WATCH_THEME_DARK
         || !valid_title(packet->config.title)) {
         return false;
@@ -1855,15 +1946,24 @@ static bool validate_config_packet(const WATCH_CONFIG_PACKET *packet, int64_t re
         }
     } else if (is_ftable_domain(packet->config.domain)) {
         const WATCH_MSG_FTABLE_CONFIG *config = &packet->config.settings.ftable;
-        if (config->win_size == 0U
-            || config->win_size > MAX_FTABLE_SAMPLES
-            || !valid_range(&config->yrange, false)) {
+        if (config->win_size == 0U || config->win_size > MAX_FTABLE_SAMPLES || !valid_range(&config->yrange, false)) {
             return false;
         }
     } else if (is_point_domain(packet->config.domain)) {
         const WATCH_MSG_POINT_CONFIG *config = &packet->config.settings.point;
-        if (!valid_range(&config->xrange, false)
-            || !valid_range(&config->yrange, false)) {
+        if (!valid_range(&config->xrange, false) || !valid_range(&config->yrange, false)) {
+            return false;
+        }
+    } else if (is_meter_domain(packet->config.domain)) {
+        const WATCH_MSG_METER_CONFIG *config = &packet->config.settings.meter;
+        // a decibel axis lives below zero, a gain axis cannot go under it
+        bool value_is_nonnegative = config->scale != WATCH_SCALE_DECIBEL;
+        bool scale_is_supported = config->scale == WATCH_SCALE_LINEAR_GAIN || config->scale == WATCH_SCALE_DECIBEL;
+        if (config->nchnls == 0U
+            || config->nchnls > MAX_METER_CHANNELS
+            || config->nyticks > MAX_GRID_TICKS
+            || !scale_is_supported
+            || !valid_range(&config->yrange, value_is_nonnegative)) {
             return false;
         }
     } else {
@@ -1941,16 +2041,11 @@ static bool validate_point_data_packet(const WATCH_DATA_PACKET *packet, int64_t 
         return false;
     }
 
-    uint32_t expected_payload =
-        (uint32_t) offsetof(WATCH_MSG_DATA, samples)
-        + packet->data.sample_count * 2U * (uint32_t) sizeof(float);
+    uint32_t expected_payload = (uint32_t) offsetof(WATCH_MSG_DATA, samples) + packet->data.sample_count * 2U * (uint32_t) sizeof(float);
     return packet->header.payload_size == expected_payload;
 }
 
-static bool validate_ftable_data_packet(
-    const WATCH_FTABLE_DATA_PACKET *packet,
-    int64_t received
-) {
+static bool validate_ftable_data_packet(const WATCH_FTABLE_DATA_PACKET *packet, int64_t received) {
     if (!validate_header(&packet->header, received)
         || packet->header.type != FTABLE_DATA
         || packet->header.sequence < 0
@@ -1977,14 +2072,33 @@ static bool validate_ftable_data_packet(
     return packet->header.payload_size == expected_payload;
 }
 
-static bool validate_session_close_packet(
-    const WATCH_SESSION_CLOSE_PACKET *packet,
-    int64_t received
-) {
+static bool validate_meter_data_packet(const WATCH_METER_DATA_PACKET *packet, int64_t received) {
+    if (!validate_header(&packet->header, received)
+        || packet->header.type != METER_DATA
+        || packet->header.sequence < 0
+        || packet->data.graph_id == 0U
+        || packet->data.stream_id >= MAX_STREAMS
+        || packet->data.channel_count == 0U
+        || packet->data.channel_count > MAX_METER_CHANNELS) {
+        return false;
+    }
+
+    uint32_t expected_payload = (uint32_t) offsetof(WATCH_MSG_METER_DATA, levels) + packet->data.channel_count * (uint32_t) sizeof(float);
+    return packet->header.payload_size == expected_payload;
+}
+
+static bool validate_session_close_packet(const WATCH_SESSION_CLOSE_PACKET *packet, int64_t received) {
     return validate_header(&packet->header, received)
         && packet->header.type == SESSION_CLOSE
         && packet->header.payload_size == sizeof(WATCH_MSG_SESSION_CLOSE)
         && packet->close.reserved == 0U;
+}
+
+static bool validate_graph_close_packet(const WATCH_GRAPH_CLOSE_PACKET *packet, int64_t received) {
+    return validate_header(&packet->header, received)
+        && packet->header.type == GRAPH_CLOSE
+        && packet->header.payload_size == sizeof(WATCH_MSG_GRAPH_CLOSE)
+        && packet->close.graph_id != 0U;
 }
 
 static void resolve_scope_range(const WATCH_MSG_TIME_CONFIG *config, float *ymin, float *ymax) {
@@ -2024,6 +2138,46 @@ static void resolve_point_range(const WATCH_RANGE *range, float *minimum, float 
     }
 }
 
+/*
+ * Like the point plane, the meter scale is a reference and must not follow the
+ * signal: an omitted limit falls back to a fixed default. The default span
+ * depends on the unit - sixty decibels cover the useful part of a mix, while a
+ * gain axis is read against unity.
+ */
+static void resolve_meter_range(const WATCH_MSG_METER_CONFIG *config, float *ymin, float *ymax) {
+    bool decibel = config->scale == WATCH_SCALE_DECIBEL;
+    float span = decibel ? METER_DEFAULT_DB_SPAN : 1.0f;
+
+    if (config->yrange.is_min_auto && config->yrange.is_max_auto) {
+        *ymax = decibel ? 0.0f : 1.0f;
+        *ymin = decibel ? -METER_DEFAULT_DB_SPAN : 0.0f;
+    } else if (config->yrange.is_min_auto) {
+        *ymax = config->yrange.max;
+        *ymin = *ymax - span;
+    } else if (config->yrange.is_max_auto) {
+        *ymin = config->yrange.min;
+        *ymax = *ymin + span;
+    } else {
+        *ymin = config->yrange.min;
+        *ymax = config->yrange.max;
+    }
+}
+
+/*
+ * The plot keeps one grid division of headroom above the declared maximum. A
+ * bar pinned to the top edge looks the same whether it went over by a hair or
+ * by twenty decibels, so the range has to end somewhere visible rather than at
+ * the border. One division keeps the tick values round: the step is unchanged
+ * and the axis simply carries one more of them.
+ */
+static void resolve_meter_axis(const WATCH_MSG_METER_CONFIG *config, float *ymin, float *ytop, uint32_t *divisions) {
+    float ymax;
+    resolve_meter_range(config, ymin, &ymax);
+    uint32_t range_divisions = config->nyticks == 0U ? DEFAULT_Y_TICKS : config->nyticks;
+    *ytop = ymax + (ymax - *ymin) / (float) range_divisions;
+    *divisions = range_divisions + 1U;
+}
+
 static bool resolve_ftable_range(const VIEW_GRAPH *graph, float *ymin, float *ymax) {
     const WATCH_MSG_FTABLE_CONFIG *config = &graph->config.settings.ftable;
     bool needs_data = config->yrange.is_min_auto || config->yrange.is_max_auto;
@@ -2042,10 +2196,8 @@ static bool resolve_ftable_range(const VIEW_GRAPH *graph, float *ymin, float *ym
                 data_maximum = stream->data_maximum;
                 found = true;
             } else {
-                data_minimum =
-                    fminf(data_minimum, stream->data_minimum);
-                data_maximum =
-                    fmaxf(data_maximum, stream->data_maximum);
+                data_minimum = fminf(data_minimum, stream->data_minimum);
+                data_maximum = fmaxf(data_maximum, stream->data_maximum);
             }
         }
     }
@@ -2075,11 +2227,7 @@ static bool resolve_ftable_range(const VIEW_GRAPH *graph, float *ymin, float *ym
     return *ymax > *ymin;
 }
 
-static bool resolve_frequency_axis_range(
-    const VIEW_GRAPH *graph,
-    float *minimum,
-    float *maximum
-) {
+static bool resolve_frequency_axis_range(const VIEW_GRAPH *graph, float *minimum, float *maximum) {
     const WATCH_MSG_SPECTRAL_CONFIG *config = &graph->config.settings.spectral;
     const STREAM_SPECTRAL_BUFFER *reference_stream = NULL;
     for (uint32_t i = 0; i < MAX_STREAMS; i++) {
@@ -2106,14 +2254,9 @@ static bool resolve_frequency_axis_range(
 }
 
 static bool ensure_graph_tick_labels(VIEW_GRAPH *graph) {
-    uint32_t x_intervals;
-    uint32_t y_intervals;
-    float xmin;
-    float xmax;
-    float ymin;
-    float ymax;
-    TICK_VALUE_FORMAT x_format;
-    TICK_VALUE_FORMAT y_format;
+    uint32_t x_intervals, y_intervals;
+    float xmin, xmax, ymin, ymax;
+    TICK_VALUE_FORMAT x_format, y_format;
 
     if (is_time_domain(graph->config.domain)) {
         const WATCH_MSG_TIME_CONFIG *config = &graph->config.settings.time;
@@ -2132,6 +2275,19 @@ static bool ensure_graph_tick_labels(VIEW_GRAPH *graph) {
         x_intervals = POINT_TICKS;
         y_intervals = POINT_TICKS;
         x_format = TICK_FORMAT_NUMBER;
+        y_format = TICK_FORMAT_NUMBER;
+    } else if (is_meter_domain(graph->config.domain)) {
+        const WATCH_MSG_METER_CONFIG *config = &graph->config.settings.meter;
+        // the labelled axis includes the headroom, so its top is above ymax
+        resolve_meter_axis(config, &ymin, &ymax, &y_intervals);
+        /*
+         * Two intervals per channel: the odd grid indices land on the bar
+         * centres, which is where prepare_channel_tick_axis() writes the names.
+         */
+        xmin = 0.0f;
+        xmax = (float) config->nchnls;
+        x_intervals = config->nchnls * 2U;
+        x_format = TICK_FORMAT_CHANNEL;
         y_format = TICK_FORMAT_NUMBER;
     } else if (is_ftable_domain(graph->config.domain)) {
         const WATCH_MSG_FTABLE_CONFIG *config = &graph->config.settings.ftable;
@@ -2169,16 +2325,7 @@ static bool ensure_graph_tick_labels(VIEW_GRAPH *graph) {
         return false;
     }
 
-    return ensure_tick_labels(
-        graph,
-        x_intervals,
-        y_intervals,
-        xmin,
-        xmax,
-        ymin,
-        ymax,
-        x_format,
-        y_format);
+    return ensure_tick_labels(graph, x_intervals, y_intervals, xmin, xmax, ymin, ymax, x_format, y_format);
 }
 
 static void position_graph_window(SDL_Window *window, uint32_t graph_slot) {
@@ -2192,12 +2339,8 @@ static void position_graph_window(SDL_Window *window, uint32_t graph_slot) {
         return;
     }
 
-    uint32_t columns = usable.w > INITIAL_WIDTH
-        ? (uint32_t) (usable.w / INITIAL_WIDTH)
-        : 1U;
-    uint32_t rows = usable.h > INITIAL_HEIGTH
-        ? (uint32_t) (usable.h / INITIAL_HEIGTH)
-        : 1U;
+    uint32_t columns = usable.w > INITIAL_WIDTH ? (uint32_t) (usable.w / INITIAL_WIDTH) : 1U;
+    uint32_t rows = usable.h > INITIAL_HEIGTH ? (uint32_t) (usable.h / INITIAL_HEIGTH) : 1U;
     uint32_t cell_count = columns * rows;
     uint32_t cell = cell_count > 0U ? graph_slot % cell_count : 0U;
     uint32_t column = cell % columns;
@@ -2216,9 +2359,7 @@ static void position_graph_window(SDL_Window *window, uint32_t graph_slot) {
     int x = usable.x + (int) column * cell_width + horizontal_margin;
     int y = usable.y + (int) row * cell_height + vertical_margin;
     if (!SDL_SetWindowPosition(window, x, y)) {
-        SDL_Log(
-            "[watch-viewer] graph window positioning failed: %s",
-            SDL_GetError());
+        SDL_Log("[watch-viewer] graph window positioning failed: %s", SDL_GetError());
     }
 }
 
@@ -2262,6 +2403,11 @@ static VIEW_GRAPH *create_graph(VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS], const WATC
         if (graph->point_streams == NULL) {
             return NULL;
         }
+    } else if (is_meter_domain(config->domain)) {
+        graph->meter_stream = prepare_meter_buffer();
+        if (graph->meter_stream == NULL) {
+            return NULL;
+        }
     } else {
         return NULL;
     }
@@ -2280,6 +2426,8 @@ static VIEW_GRAPH *create_graph(VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS], const WATC
             free_spectral_buffers(graph->spectral_streams);
         } else if (is_point_domain(config->domain)) {
             free_point_buffers(graph->point_streams);
+        } else if (is_meter_domain(config->domain)) {
+            free_meter_buffer(graph->meter_stream);
         } else {
             free_ftable_buffers(graph->ftable_streams);
         }
@@ -2288,10 +2436,7 @@ static VIEW_GRAPH *create_graph(VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS], const WATC
         return NULL;
     }
 
-    if (!SDL_SetWindowMinimumSize(
-            graph->window,
-            MINIMUM_WIDTH,
-            MINIMUM_HEIGTH)) {
+    if (!SDL_SetWindowMinimumSize(graph->window, MINIMUM_WIDTH, MINIMUM_HEIGTH)) {
         SDL_Log(
             "[watch-viewer] graph %u minimum window size failed: %s",
             config->graph_id,
@@ -2299,6 +2444,7 @@ static VIEW_GRAPH *create_graph(VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS], const WATC
         destroy_graph(graph);
         return NULL;
     }
+
     position_graph_window(graph->window, graph_slot);
 
     SDL_SetRenderDrawBlendMode(graph->renderer, SDL_BLENDMODE_BLEND);
@@ -2421,6 +2567,27 @@ static uint32_t process_session_close_packet(
     return closed_graphs;
 }
 
+/*
+ * One graph of a session that is still running, so the viewer keeps waiting for
+ * the rest: a window closing here is not a reason to shut down, unlike the last
+ * window being closed by hand.
+ */
+static void process_graph_close_packet(
+    VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS],
+    const WATCH_GRAPH_CLOSE_PACKET *packet,
+    int64_t received,
+    const watch_endpoint_t *sender
+) {
+    if (!validate_graph_close_packet(packet, received)) {
+        return;
+    }
+
+    VIEW_GRAPH *graph = find_graph(graphs, packet->close.graph_id, sender);
+    if (graph != NULL) {
+        destroy_graph(graph);
+    }
+}
+
 static void process_data_packet(
     VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS],
     const WATCH_DATA_PACKET *packet,
@@ -2436,8 +2603,7 @@ static void process_data_packet(
         return;
     }
 
-    float ymin;
-    float ymax;
+    float ymin, ymax;
     const WATCH_MSG_TIME_CONFIG *config = &graph->config.settings.time;
     resolve_scope_range(config, &ymin, &ymax);
 
@@ -2469,13 +2635,8 @@ static void begin_spectral_frame(STREAM_SPECTRAL_BUFFER *stream, const WATCH_SPE
     stream->assembling = true;
 }
 
-static bool append_spectrogram_frame(
-    const WATCH_MSG_SPECTRAL_CONFIG *config,
-    STREAM_SPECTRAL_BUFFER *stream,
-    WATCH_GRAPH_THEME theme
-) {
-    float minimum;
-    float maximum;
+static bool append_spectrogram_frame(const WATCH_MSG_SPECTRAL_CONFIG *config, STREAM_SPECTRAL_BUFFER *stream, WATCH_GRAPH_THEME theme) {
+    float minimum, maximum;
     resolve_spectral_static_range(config, &minimum, &maximum);
 
     for (uint32_t bin = 0; bin < stream->total_bins; bin++) {
@@ -2575,10 +2736,7 @@ static void process_spectral_packet(
     if (graph->config.domain == WATCH_DOMAIN_SPECTRUM) {
         memcpy(stream->display_bins, stream->assembly_bins, stream->total_bins * sizeof(float));
         stream->display_ready = true;
-    } else if (!append_spectrogram_frame(
-            config,
-            stream,
-            graph->config.theme)) {
+    } else if (!append_spectrogram_frame(config, stream, graph->config.theme)) {
         /*
          * The texture is unusable from here on: reject the stream so that the
          * next frames neither retry the update nor repeat the diagnostic.
@@ -2624,9 +2782,7 @@ static bool ensure_ftable_stream(STREAM_FTABLE_BUFFER *stream, const WATCH_MSG_F
 }
 
 static bool prepare_ftable_envelope(STREAM_FTABLE_BUFFER *stream) {
-    uint32_t count = stream->total_samples < MAX_FTABLE_RENDER_BUCKETS
-        ? stream->total_samples
-        : MAX_FTABLE_RENDER_BUCKETS;
+    uint32_t count = stream->total_samples < MAX_FTABLE_RENDER_BUCKETS ? stream->total_samples : MAX_FTABLE_RENDER_BUCKETS;
     float *minimums = malloc((size_t) count * sizeof(float));
     float *maximums = malloc((size_t) count * sizeof(float));
     if (minimums == NULL || maximums == NULL) {
@@ -2665,9 +2821,7 @@ static void process_point_packet(
     }
 
     VIEW_GRAPH *graph = find_graph(graphs, packet->data.graph_id, sender);
-    if (graph == NULL
-        || !is_point_domain(graph->config.domain)
-        || graph->point_streams == NULL) {
+    if (graph == NULL || !is_point_domain(graph->config.domain) || graph->point_streams == NULL) {
         return;
     }
 
@@ -2735,8 +2889,7 @@ static void process_ftable_packet(
         return;
     }
 
-    uint32_t chunk_index =
-        packet->data.sample_offset / MAX_STREAM_SAMPLES;
+    uint32_t chunk_index = packet->data.sample_offset / MAX_STREAM_SAMPLES;
     if (stream->received_chunks[chunk_index] != 0U) {
         return;
     }
@@ -2749,10 +2902,8 @@ static void process_ftable_packet(
             stream->data_maximum = sample;
             stream->has_range = true;
         } else {
-            stream->data_minimum =
-                fminf(stream->data_minimum, sample);
-            stream->data_maximum =
-                fmaxf(stream->data_maximum, sample);
+            stream->data_minimum = fminf(stream->data_minimum, sample);
+            stream->data_maximum = fmaxf(stream->data_maximum, sample);
         }
     }
     stream->received_chunks[chunk_index] = 1U;
@@ -2778,6 +2929,72 @@ static void process_ftable_packet(
             packet->data.stream_id,
             packet->data.transfer_id,
             packet->data.total_samples);
+    }
+}
+
+/*
+ * The levels arrive ready to be plotted: they are whatever the user measured -
+ * an rms, a follow, a decibel reading - expressed in the unit the graph was
+ * configured with, so nothing is converted here.
+ *
+ * Only the attack is applied: packets arrive in bursts and at irregular
+ * intervals, so decaying on arrival would tie the fall of the bar to the packet
+ * rate. The release runs in render_meter(), against the wall clock.
+ */
+static void process_meter_packet(
+    VIEW_GRAPH graphs[MAX_VIEWER_GRAPHS],
+    const WATCH_METER_DATA_PACKET *packet,
+    int64_t received,
+    const watch_endpoint_t *sender
+) {
+    if (!validate_meter_data_packet(packet, received)) {
+        return;
+    }
+
+    VIEW_GRAPH *graph = find_graph(graphs, packet->data.graph_id, sender);
+    if (graph == NULL || !is_meter_domain(graph->config.domain) || graph->meter_stream == NULL) {
+        return;
+    }
+
+    // the configuration decides how many bars exist; extra channels are ignored
+    uint32_t channel_count = packet->data.channel_count;
+    if (channel_count > graph->config.settings.meter.nchnls) {
+        channel_count = graph->config.settings.meter.nchnls;
+    }
+
+    STREAM_METER_BUFFER *stream = graph->meter_stream;
+    uint64_t now_ns = SDL_GetTicksNS();
+    if (!stream->has_frame) {
+        /*
+         * Silence is the bottom of the axis, not zero: on a decibel meter zero
+         * is full scale, and a freshly allocated buffer would show every bar
+         * pinned to the top until the first release.
+         */
+        float ymin, ymax;
+        resolve_meter_range(&graph->config.settings.meter, &ymin, &ymax);
+        for (uint32_t i = 0U; i < MAX_METER_CHANNELS; i++) {
+            stream->level[i] = ymin;
+            stream->peak[i] = ymin;
+        }
+        stream->last_frame_ns = now_ns;
+        stream->has_frame = true;
+    }
+
+    for (uint32_t i = 0U; i < channel_count; i++) {
+        float level = packet->data.levels[i];
+        if (!isfinite(level)) {
+            continue;
+        }
+        /*
+         * The bar takes the value as it comes, up or down: the packet already
+         * carries the loudest value of one viewer frame, so holding it any
+         * longer would only put the display behind the sound.
+         */
+        stream->level[i] = level;
+        if (level >= stream->peak[i]) {
+            stream->peak[i] = level;
+            stream->peak_time_ns[i] = now_ns;
+        }
     }
 }
 
@@ -2814,11 +3031,7 @@ static bool spectral_bin_range(
     return true;
 }
 
-static void render_spectrum(
-    VIEW_GRAPH *graph,
-    PLOT_AREA *plot,
-    bool supersampled
-) {
+static void render_spectrum(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled) {
     const WATCH_MSG_SPECTRAL_CONFIG *config = &graph->config.settings.spectral;
     uint32_t nxticks = config->nxticks == 0U ? DEFAULT_X_TICKS : config->nxticks;
     uint32_t nyticks = config->nyticks == 0U ? DEFAULT_Y_TICKS : config->nyticks;
@@ -2830,8 +3043,7 @@ static void render_spectrum(
         (int) nyticks,
         graph->config.theme);
 
-    float minimum_value;
-    float maximum_value;
+    float minimum_value, maximum_value;
     resolve_spectral_static_range(config, &minimum_value, &maximum_value);
 
     SDL_Rect clip = get_plot_clip_rect(plot);
@@ -2842,15 +3054,10 @@ static void render_spectrum(
         if (!stream->display_ready || stream->display_bins == NULL || stream->plot_points == NULL) {
             continue;
         }
-        set_stream_draw_color(
-            graph->renderer,
-            graph->config.theme,
-            stream_index);
+        set_stream_draw_color(graph->renderer, graph->config.theme, stream_index);
 
-        uint32_t first_bin;
-        uint32_t last_bin;
-        float minimum_frequency;
-        float maximum_frequency;
+        uint32_t first_bin, last_bin;
+        float minimum_frequency, maximum_frequency;
         if (!spectral_bin_range(config, stream, &first_bin, &last_bin, &minimum_frequency, &maximum_frequency)) {
             continue;
         }
@@ -2885,8 +3092,7 @@ static void render_spectrogram_history(SDL_Renderer *renderer, const PLOT_AREA *
         return;
     }
 
-    uint32_t first_bin;
-    uint32_t last_bin;
+    uint32_t first_bin, last_bin;
     float minimum_frequency;
     float maximum_frequency;
     if (!spectral_bin_range(config, stream, &first_bin, &last_bin, &minimum_frequency, &maximum_frequency)) {
@@ -2989,8 +3195,7 @@ static void render_ftable(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled)
         (int) nyticks,
         graph->config.theme);
 
-    float ymin;
-    float ymax;
+    float ymin, ymax;
     if (!resolve_ftable_range(graph, &ymin, &ymax)) {
         return;
     }
@@ -3009,22 +3214,16 @@ static void render_ftable(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled)
     SDL_SetRenderClipRect(graph->renderer, &clip);
 
     float raster_width = plot->right - plot->left;
-    uint32_t column_count = raster_width >= 0.0f
-        ? (uint32_t) floorf(raster_width) + 1U
-        : 0U;
+    uint32_t column_count = raster_width >= 0.0f ? (uint32_t) floorf(raster_width) + 1U : 0U;
 
     for (uint32_t stream_index = 0U;
          stream_index < MAX_STREAMS;
          stream_index++) {
-        STREAM_FTABLE_BUFFER *stream =
-            &graph->ftable_streams[stream_index];
+        STREAM_FTABLE_BUFFER *stream = &graph->ftable_streams[stream_index];
         if (!stream->display_ready || stream->samples == NULL || stream->total_samples == 0U) {
             continue;
         }
-        set_stream_draw_color(
-            graph->renderer,
-            graph->config.theme,
-            stream_index);
+        set_stream_draw_color(graph->renderer, graph->config.theme, stream_index);
 
         if (column_count > 0U
             && (uint64_t) stream->total_samples > (uint64_t) column_count * 2U) {
@@ -3044,21 +3243,15 @@ static void render_ftable(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled)
                     minimum = fminf(minimum, stream->envelope_minimums[i]);
                     maximum = fmaxf(maximum, stream->envelope_maximums[i]);
                 }
+                uint64_t first_sample_count = ((uint64_t) column * stream->total_samples) / column_count;
+                uint64_t end_sample_count = ((uint64_t) (column + 1U) * stream->total_samples) / column_count;
+                uint32_t first_sample = (uint32_t) first_sample_count;
+                uint32_t end_sample = (uint32_t) end_sample_count;
+                float sample_col = (float) column * raster_width / (float) (column_count - 1U);
+                float x = column_count > 1U ? plot->left + sample_col : plot->left;
 
-                uint32_t first_sample = (uint32_t) (
-                    ((uint64_t) column * stream->total_samples) / column_count);
-                uint32_t end_sample = (uint32_t) (
-                    ((uint64_t) (column + 1U) * stream->total_samples) / column_count);
-                float x = column_count > 1U
-                    ? plot->left
-                        + (float) column * raster_width
-                            / (float) (column_count - 1U)
-                    : plot->left;
-                float first_y = ftable_sample_y(
-                    plot,
-                    stream->samples[first_sample],
-                    ymin,
-                    ymax);
+                float s = stream->samples[first_sample];
+                float first_y = ftable_sample_y(plot, s, ymin, ymax);
                 if (has_previous) {
                     draw_waveform_line(
                         graph->renderer,
@@ -3090,30 +3283,17 @@ static void render_ftable(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled)
 
         if (stream->total_samples == 1U) {
             float f = ftable_sample_y(plot, stream->samples[0], ymin, ymax);
-            draw_waveform_point(
-                graph->renderer,
-                plot->left,
-                f,
-                supersampled);
+            draw_waveform_point(graph->renderer, plot->left, f, supersampled);
             continue;
         }
 
-        float x_step =
-            plot->plot_width / (float) (stream->total_samples - 1U);
+        float x_step = plot->plot_width / (float) (stream->total_samples - 1U);
         float previous_x = plot->left;
-        float previous_y =
-            ftable_sample_y(plot, stream->samples[0], ymin, ymax);
+        float previous_y = ftable_sample_y(plot, stream->samples[0], ymin, ymax);
         for (uint32_t i = 1U; i < stream->total_samples; i++) {
             float x = plot->left + (float) i * x_step;
-            float y =
-                ftable_sample_y(plot, stream->samples[i], ymin, ymax);
-            draw_waveform_line(
-                graph->renderer,
-                previous_x,
-                previous_y,
-                x,
-                y,
-                supersampled);
+            float y = ftable_sample_y(plot, stream->samples[i], ymin, ymax);
+            draw_waveform_line(graph->renderer, previous_x, previous_y, x, y, supersampled);
             previous_x = x;
             previous_y = y;
         }
@@ -3163,10 +3343,7 @@ static void render_point(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled) 
         (int) POINT_TICKS,
         graph->config.theme);
 
-    float xmin;
-    float xmax;
-    float ymin;
-    float ymax;
+    float xmin, xmax, ymin, ymax;
     resolve_point_range(&config->xrange, &xmin, &xmax);
     resolve_point_range(&config->yrange, &ymin, &ymax);
     if (!(xmax > xmin) || !(ymax > ymin)) {
@@ -3188,9 +3365,7 @@ static void render_point(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled) 
 
     for (uint32_t stream_index = 0U; stream_index < MAX_STREAMS; stream_index++) {
         STREAM_POINT_BUFFER *stream = &graph->point_streams[stream_index];
-        if (stream->coordinates == NULL
-            || stream->plot_points == NULL
-            || stream->valid_points == 0U) {
+        if (stream->coordinates == NULL || stream->plot_points == NULL || stream->valid_points == 0U) {
             continue;
         }
 
@@ -3202,10 +3377,8 @@ static void render_point(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled) 
         }
 
         set_stream_draw_color(graph->renderer, graph->config.theme, stream_index);
-        uint8_t red;
-        uint8_t green;
-        uint8_t blue;
-        uint8_t alpha;
+
+        uint8_t red, green, blue, alpha;
         SDL_GetRenderDrawColor(graph->renderer, &red, &green, &blue, &alpha);
 
         /*
@@ -3213,9 +3386,7 @@ static void render_point(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled) 
          * movement is readable from a single frame.
          */
         for (uint32_t i = 1U; i < stream->valid_points; i++) {
-            float age = stream->valid_points > 1U
-                ? (float) i / (float) (stream->valid_points - 1U)
-                : 1.0f;
+            float age = stream->valid_points > 1U ? (float) i / (float) (stream->valid_points - 1U) : 1.0f;
             float segment_alpha = POINT_TRAIL_MIN_ALPHA + (255.0f - POINT_TRAIL_MIN_ALPHA) * age;
             SDL_SetRenderDrawColor(graph->renderer, red, green, blue, (uint8_t) lrintf(segment_alpha));
             SDL_RenderLine(
@@ -3241,6 +3412,92 @@ static void render_point(VIEW_GRAPH *graph, PLOT_AREA *plot, bool supersampled) 
     SDL_SetRenderClipRect(graph->renderer, NULL);
 }
 
+static float meter_value_y(const PLOT_AREA *plot, float value, float ymin, float ymax) {
+    value = fminf(fmaxf(value, ymin), ymax);
+    return plot->bottom - ((value - ymin) / (ymax - ymin)) * plot->plot_heigth;
+}
+
+static void render_meter(VIEW_GRAPH *graph, PLOT_AREA *plot) {
+    const WATCH_MSG_METER_CONFIG *config = &graph->config.settings.meter;
+    uint32_t nchnls = config->nchnls;
+    float density = graph_pixel_density(graph);
+
+    float ymin;
+    float ytop;
+    uint32_t divisions;
+    resolve_meter_axis(config, &ymin, &ytop, &divisions);
+
+    draw_meter(graph->renderer, plot, density, nchnls, (int) divisions, graph->config.theme);
+
+    STREAM_METER_BUFFER *stream = graph->meter_stream;
+    if (stream == NULL || !stream->has_frame || nchnls == 0U || !(ytop > ymin)) {
+        return;
+    }
+
+    uint64_t now_ns = SDL_GetTicksNS();
+    float elapsed = (float) ((double) (now_ns - stream->last_frame_ns) / 1.0e9);
+    stream->last_frame_ns = now_ns;
+    if (!(elapsed > 0.0f) || elapsed > 1.0f) {
+        elapsed = 0.0f;
+    }
+
+    float slot = plot->plot_width / (float) nchnls;
+    float bar_width = slot * METER_BAR_FILL;
+    float peak_thickness = fmaxf(METER_PEAK_THICKNESS * density, 1.0f);
+
+    SDL_Rect clip = get_plot_clip_rect(plot);
+    SDL_SetRenderClipRect(graph->renderer, &clip);
+
+    for (uint32_t i = 0U; i < nchnls; i++) {
+        /*
+         * Only the peak falls on its own, and only once it has been held: the
+         * bar carries the level as received, so it reaches the eye a frame
+         * after the sound rather than a release later.
+         *
+         * The fall stops on the bar. Nothing else does: the bar no longer
+         * decays along with it, so a peak left above a steady level would sink
+         * through it and end up as a mark drawn across the middle of a bar.
+         */
+        float held = (float) ((double) (now_ns - stream->peak_time_ns[i]) / 1.0e9);
+        if (held > METER_PEAK_HOLD_SECONDS) {
+            stream->peak[i] = ymin + (stream->peak[i] - ymin) * expf(-elapsed / METER_PEAK_RELEASE_SECONDS);
+        }
+        stream->peak[i] = fmaxf(stream->peak[i], stream->level[i]);
+
+        float center_x = plot->left + ((float) i + 0.5f) * slot;
+        float bar_left = center_x - bar_width * 0.5f;
+
+        float level_value = stream->level[i];
+        if (level_value > ymin) {
+            // one color for every bar: they are told apart by their position
+            set_stream_draw_color(graph->renderer, graph->config.theme, 0U);
+            float level_y = meter_value_y(plot, level_value, ymin, ytop);
+            SDL_FRect bar = {
+                .x = bar_left,
+                .y = level_y,
+                .w = bar_width,
+                .h = plot->bottom - level_y
+            };
+            SDL_RenderFillRect(graph->renderer, &bar);
+        }
+
+        float peak_value = stream->peak[i];
+        if (peak_value > ymin) {
+            set_meter_peak_color(graph->renderer, graph->config.theme);
+            float peak_y = meter_value_y(plot, peak_value, ymin, ytop);
+            SDL_FRect peak_mark = {
+                .x = bar_left,
+                .y = peak_y - peak_thickness * 0.5f,
+                .w = bar_width,
+                .h = peak_thickness
+            };
+            SDL_RenderFillRect(graph->renderer, &peak_mark);
+        }
+    }
+
+    SDL_SetRenderClipRect(graph->renderer, NULL);
+}
+
 static void render_graph(VIEW_GRAPH *graph) {
     if (!graph->ready || graph->renderer == NULL) {
         return;
@@ -3251,15 +3508,21 @@ static void render_graph(VIEW_GRAPH *graph) {
     }
     (void) ensure_graph_tick_labels(graph);
 
+    /*
+     * The scale belongs to the supersampled target: setting it before knowing
+     * whether that target exists leaves the window renderer scaled by two when
+     * the texture could not be created, and the frame is then drawn into a
+     * quarter of the window.
+     */
     bool supersampled = ensure_graph_render_target(graph);
     if (supersampled) {
         supersampled =
-            SDL_SetRenderTarget(graph->renderer, graph->render_target) &&
-            SDL_SetRenderScale(graph->renderer, (float) RENDER_SUPERSAMPLE_SCALE, (float) RENDER_SUPERSAMPLE_SCALE);
-        if (!supersampled) {
-            SDL_SetRenderTarget(graph->renderer, NULL);
-            SDL_SetRenderScale(graph->renderer, 1.0f, 1.0f);
-        }
+            SDL_SetRenderTarget(graph->renderer, graph->render_target)
+            && SDL_SetRenderScale(graph->renderer, (float) RENDER_SUPERSAMPLE_SCALE, (float) RENDER_SUPERSAMPLE_SCALE);
+    }
+    if (!supersampled) {
+        SDL_SetRenderTarget(graph->renderer, NULL);
+        SDL_SetRenderScale(graph->renderer, 1.0f, 1.0f);
     }
 
     PLOT_AREA plot = get_plot_area(graph);
@@ -3273,23 +3536,11 @@ static void render_graph(VIEW_GRAPH *graph) {
         .h = plot.plot_heigth
     };
 
-    set_themed_draw_color(
-        graph->renderer,
-        graph->config.theme,
-        224U,
-        255U);
+    set_themed_draw_color(graph->renderer, graph->config.theme, 224U, 255U);
     SDL_RenderClear(graph->renderer);
-    set_themed_draw_color(
-        graph->renderer,
-        graph->config.theme,
-        255U,
-        255U);
+    set_themed_draw_color(graph->renderer, graph->config.theme, 255U, 255U);
     SDL_RenderFillRect(graph->renderer, &border);
-    set_themed_draw_color(
-        graph->renderer,
-        graph->config.theme,
-        0U,
-        255U);
+    set_themed_draw_color(graph->renderer, graph->config.theme, 0U, 255U);
     SDL_RenderRect(graph->renderer, &border);
 
     if (is_time_domain(graph->config.domain)) {
@@ -3309,11 +3560,7 @@ static void render_graph(VIEW_GRAPH *graph) {
         resolve_scope_range(config, &ymin, &ymax);
         if (ymin <= 0.0f && ymax >= 0.0f) {
             float zero = plot.bottom - ((0.0f - ymin) / (ymax - ymin)) * plot.plot_heigth;
-            set_themed_draw_color(
-                graph->renderer,
-                graph->config.theme,
-                0U,
-                255U);
+            set_themed_draw_color(graph->renderer, graph->config.theme, 0U, 255U);
             SDL_RenderLine(graph->renderer, plot.left, zero, plot.right - 1.0f, zero);
         }
 
@@ -3341,6 +3588,8 @@ static void render_graph(VIEW_GRAPH *graph) {
         render_ftable(graph, &plot, supersampled);
     } else if (graph->config.domain == WATCH_DOMAIN_POINT) {
         render_point(graph, &plot, supersampled);
+    } else if (graph->config.domain == WATCH_DOMAIN_METER) {
+        render_meter(graph, &plot);
     }
 
     set_themed_draw_color(
@@ -3454,9 +3703,7 @@ int main(int argc, char *argv[]) {
             switch (packet.header.type) {
                 case CONFIG:
                     process_config_packet(receiver_socket, graphs, &packet.config, received, &sender);
-                    if (has_opened_graph(graphs)) {
-                        shutdown_deadline_ns = 0U;
-                    }
+                    if (has_opened_graph(graphs)) shutdown_deadline_ns = 0U;
                     break;
                 case DATA:
                     process_data_packet(graphs, &packet.data, received, &sender);
@@ -3469,6 +3716,12 @@ int main(int argc, char *argv[]) {
                     break;
                 case POINT_DATA:
                     process_point_packet(graphs, &packet.data, received, &sender);
+                    break;
+                case METER_DATA:
+                    process_meter_packet(graphs, &packet.meter, received, &sender);
+                    break;
+                case GRAPH_CLOSE:
+                    process_graph_close_packet(graphs, &packet.graph_close, received, &sender);
                     break;
                 case SESSION_CLOSE:
                     if (process_session_close_packet(graphs, &packet.close, received, &sender) > 0U && !has_opened_graph(graphs)) {

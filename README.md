@@ -2,8 +2,8 @@
 
 Csound Watch is a Csound 7 plugin for real-time signal visualization. It
 provides simple opcodes for creating oscilloscope, control-signal, spectrum,
-spectrogram, static function-table, and moving-point windows while keeping all
-graphics work outside Csound's audio thread.
+spectrogram, static function-table, moving-point, and bar-meter windows while
+keeping all graphics work outside Csound's audio thread.
 
 Graphs are created with an init-time opcode and signals are attached with
 `watchadd`:
@@ -17,6 +17,9 @@ second:a = oscili(0.3, 440)
 watchadd(graph, first)
 watchadd(graph, second)
 ```
+
+`watchmeter` is the exception: a meter is fed by a single array of levels, so
+the opcode owns its window and needs no `watchadd`.
 
 Each graph is displayed in a separate, resizable SDL3 window. When a graph is
 created, the viewer asks the desktop window manager to bring its window to the
@@ -36,6 +39,7 @@ and normally terminates shortly after Csound stops.
 - Scrolling spectrograms from non-sliding PVS `f`-signals.
 - Complete, init-time plotting of function tables.
 - Moving points with a fading trail on a fixed, square plane.
+- Multi-channel bar meters with peak hold and headroom above the range.
 - Gain, power, and decibel spectral display scales.
 - Several compatible streams in the same graph.
 - Shared sample timeline for synchronized time-domain streams.
@@ -97,6 +101,7 @@ The transport is intended for responsive visualization, not lossless recording.
 | [`watchspectrogram`](doc/watchspectrogram.md) | Time/frequency | Create a scrolling spectrogram |
 | [`watchtable`](doc/watchtable.md) | Table index | Plot a complete function table |
 | [`watchpoint`](doc/watchpoint.md) | Plane | Create a fixed plane for moving points |
+| [`watchmeter`](doc/watchmeter.md) | Level | Display an array of levels as a bar meter |
 | [`watchtheme`](doc/watchtheme.md) | Graph appearance | Select the light or dark theme |
 | [`watchadd`](doc/watchadd.md) | Any | Attach a signal or a coordinate pair to a graph |
 
@@ -228,6 +233,34 @@ the incoming coordinates. The plot area is kept square so that a circular path
 is drawn as a circle rather than an ellipse, and the grid uses eight divisions
 per axis. A zero axis appears only when the corresponding range contains zero.
 
+### `watchmeter`
+
+```csound
+graph:i = watchmeter(levels:k[], min_value:i, max_value:i, scale:i)
+graph:i = watchmeter(levels:k[], min_value:i, max_value:i, scale:i, title:S)
+```
+
+`watchmeter` draws one bar per element of the array, labelled `ch1` through
+`chN` under the horizontal axis, and feeds itself: there is no `watchadd` for a
+meter. The array may hold from 1 through 32 elements and its length is the
+channel count.
+
+The levels are plotted as they arrive. Nothing is measured and nothing is
+converted, so the array is expected to hold levels already, typically from `rms`
+or `follow`; `scale` only declares their unit, `0` for linear gain or `2` for
+decibels. Linear power is not accepted.
+
+The range is fixed and never rescales. Above `max_value` the axis carries one
+grid division of headroom, tinted like the peak marks, so a level going over is
+seen going over instead of being pinned to the top edge; only past the headroom
+is the value clamped.
+
+The bar carries the level as received, without smoothing of its own: each packet
+already holds the loudest value of one viewer frame. Only the peak mark holds,
+for 1.5 s, before falling towards the bottom of the axis. All bars share one
+color and the peak marks another, contrasting in both hue and lightness so that
+a mark resting on its own bar is still visible. The grid is horizontal only.
+
 ### `watchtheme`
 
 ```csound
@@ -238,7 +271,9 @@ Set `theme` to `0` for the default light palette or `1` for the dark palette.
 Neutral graph components are inverted between themes. Signal curves use
 dedicated high-contrast palettes: darker colors on the light background and
 brighter colors on the dark background. Each of the 64 supported stream indices
-receives a distinct color while preserving its base hue between themes. Call
+receives a distinct color while preserving its base hue between themes. Meter
+peak marks follow the same rule with a hue and a lightness of their own, so they
+stay legible on the bar they rest on. Call
 `watchtheme` at init time after creating the graph.
 
 See the individual opcode pages in [`doc`](doc) for complete argument
@@ -282,17 +317,8 @@ nchnls = 2
 instr WatchSignals
     scope:i = watchscope(0.5, 10, 8, -1, 1, "Waveform")
     control:i = watchcontrol(2, 10, 8, -1, 1, "Control signal")
-    spectrum:i = watchspectrum(
-        20, 12000,
-        -120, 0,
-        2, 10, 8,
-        "Spectrum")
-    spectrogram:i = watchspectrogram(
-        3,
-        20, 12000,
-        -120, 0,
-        2, 8, 8,
-        "Spectrogram")
+    spectrum:i = watchspectrum(20, 12000, -120, 0, 2, 10, 8, "Spectrum")
+    spectrogram:i = watchspectrogram(3, 20, 12000, -120, 0, 2, 8, 8, "Spectrogram")
 
     signal:a = vco2(0.35, 220)
     modulation:k = oscili(0.8, 1)
@@ -321,6 +347,7 @@ Additional ready-to-run files are available in [`examples`](examples):
 - [`watchspectrogram.csd`](examples/watchspectrogram.csd)
 - [`watchtable.csd`](examples/watchtable.csd)
 - [`watchpoint.csd`](examples/watchpoint.csd)
+- [`watchmeter.csd`](examples/watchmeter.csd)
 - [`watchadd.csd`](examples/watchadd.csd)
 
 ## Runtime requirements
@@ -538,11 +565,12 @@ OPCODE7DIR64="$PWD/build" csound utest/registry.csd
 | [`spectral_audio.csd`](utest/spectral_audio.csd) | Spectral streams fed by real audio |
 | [`table_gens.csd`](utest/table_gens.csd) | GEN5, GEN7 and GEN8 tables with automatic and explicit ranges |
 | [`point.csd`](utest/point.csd) | Plane aspect, trail, several points, asymmetric ranges |
+| [`meter.csd`](utest/meter.csd) | Bar count, channel names, peak hold, clamping, 1 and 32 channels |
 | [`ftable_transfer.csd`](utest/ftable_transfer.csd) | Deferred table transfer and graph cleanup |
 | [`theme.csd`](utest/theme.csd) | Light and dark themes |
 
-The graph tests are also visual: `control_ranges.csd`, `table_gens.csd` and
-`point.csd` carry the expected result in each window title.
+The graph tests are also visual: `control_ranges.csd`, `table_gens.csd`,
+`point.csd` and `meter.csd` carry the expected result in each window title.
 
 ## Viewer discovery and lifecycle
 
@@ -558,12 +586,27 @@ The executable is resolved in this order:
 3. the standard Risset asset directory;
 4. `watch_viewer` or `watch_viewer.exe` found through `PATH`.
 
-Every `watchscope`, `watchcontrol`, `watchspectrum`, `watchspectrogram`, or
-`watchtable` call creates a new graph window. The viewer requests that each new
+Every `watchscope`, `watchcontrol`, `watchspectrum`, `watchspectrogram`,
+`watchtable`, `watchpoint`, or `watchmeter` call creates a new graph window. The viewer requests that each new
 window be raised and focused; the final decision remains subject to the desktop
 window manager's focus-stealing policy. Windows are assigned grid positions in
 the usable area of the display; positions are reused when there are more
 windows than available grid cells. Windows may be closed manually.
+
+A graph window outlives the note that created it and closes with the session, so
+a table plotted by a short note can still be read afterwards. The one exception
+is a graph replaced by a `reinit`: the opcode creates a new graph mid note, and
+the previous window, which no longer stands for anything, is closed.
+
+> [!NOTE]
+> Reinitializing a graph opcode is handled but is not a good idea. Every pass
+> replaces a window, and a window is an operating-system window with its own
+> renderer and font textures: creating and destroying one is far more expensive
+> than anything else the viewer does. At twenty reinitializations per second the
+> viewer measures around 59% of a CPU core against about 2% in normal use, and
+> the windows it is being asked to close start lagging behind the ones it is
+> being asked to open. Create graphs once, outside reinit blocks, and let the
+> signals change instead.
 
 When a Csound session ends, it sends a session-close message three times. The
 viewer closes only the windows belonging to that session. If no graphs remain,
@@ -578,7 +621,7 @@ viewer immediately.
 | Csound API | 7 |
 | Network transport | UDP over loopback |
 | Viewer endpoint | `127.0.0.1:48120` |
-| Protocol version | 4 |
+| Protocol version | 6 |
 | Maximum graphs per Csound instance | 32 |
 | Maximum open graphs in one viewer | 32 across all Csound sessions |
 | Maximum streams per graph | 64 concurrent; a slot is released when the attaching instance ends |
@@ -587,6 +630,11 @@ viewer immediately.
 | Point samples per packet | Up to 128 (two interleaved floats each) |
 | Point publishing cadence | `ceil(kr / 60)` points, one viewer frame |
 | Point trail length | Approximately 100 ms, derived from `kr` |
+| Meter channels per graph | Up to 32, set by the length of the levels array |
+| Meter publishing cadence | One frame per viewer frame: `ceil(kr / 60)` control cycles reduced to their loudest value |
+| Meter ballistics | Bar unsmoothed; peak held 1.5 s, then 1.0 s release |
+| Meter headroom | One grid division above the declared maximum |
+| Meter display latency | Up to one packet window plus one viewer frame, about 35 ms |
 | Spectral bins per packet | Up to 256 |
 | Function-table samples per packet | Up to 256 |
 | Maximum function-table size | 1,073,741,824 samples (`Csound MAXLEN`) |
@@ -679,6 +727,7 @@ Watch is not designed as a signal recorder.
 - [`watchspectrogram`](doc/watchspectrogram.md)
 - [`watchtable`](doc/watchtable.md)
 - [`watchpoint`](doc/watchpoint.md)
+- [`watchmeter`](doc/watchmeter.md)
 - [`watchtheme`](doc/watchtheme.md)
 - [`watchadd`](doc/watchadd.md)
 
