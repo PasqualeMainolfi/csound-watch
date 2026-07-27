@@ -1,0 +1,106 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}   # allow manual runs to test the build
+
+# creating/updating the release + uploading assets needs write on contents;
+# the default GITHUB_TOKEN is read-only.
+permissions:
+  contents: write
+
+env:
+  # Csound source ref to take headers from. Pinned to the Csound 7 tag whose
+  # headers this plugin was built and verified against (also the runtime Csound).
+  CSOUND_REF: 7.0.0-beta.17
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `platform` must match the id watch_release.cmake derives, which is
+          # also the platform key risset.json points its download URLs at.
+          # ubuntu-22.04 (glibc 2.35) instead of -latest so the viewer also runs
+          # on older distros; the plugin itself only needs libc.
+          - { os: ubuntu-22.04,   platform: linux-x86_64,   arch: "" }
+          - { os: macos-latest,   platform: macos-universal, arch: "arm64;x86_64" }
+          - { os: windows-latest, platform: windows-x86_64, arch: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone Csound headers
+        uses: actions/checkout@v4
+        with:
+          repository: csound/csound
+          ref: ${{ env.CSOUND_REF }}
+          path: csound-src
+
+      # SDL3 is vendored and built from source. Without these headers its
+      # configure step silently drops the X11/Wayland/ALSA backends and the
+      # viewer ends up with the dummy video driver (no window at runtime).
+      - name: Install SDL3 build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libpulse-dev libdbus-1-dev libudev-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxfixes-dev libxi-dev libxss-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libdrm-dev libgbm-dev
+
+      - name: Configure
+        shell: bash
+        run: |
+          args=(-S . -B build -DCMAKE_BUILD_TYPE=Release
+                -DCSOUND_INCLUDE_DIR="${GITHUB_WORKSPACE}/csound-src/include"
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
+          [ -n "${{ matrix.arch }}" ] && args+=(-DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}")
+          cmake "${args[@]}"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # watch_release_package is not in ALL: it stages libwatch.*/watch.dll,
+      # watch_viewer and the third-party licenses into
+      # build/dist/watch-csound7-<platform>.zip -- the exact layout the
+      # `binaries` and `assets` entries of risset.json extract from.
+      - name: Package for Risset
+        run: cmake --build build --config Release --target watch_release_package
+
+      # Guards the two ways this silently produces an unusable release: an
+      # archive named differently from what risset.json fetches, or one whose
+      # extractpath entries (plugin + viewer) are not inside it.
+      - name: Verify archive name and contents
+        shell: bash
+        run: |
+          set -e
+          zip="build/dist/watch-csound7-${{ matrix.platform }}.zip"
+          [ -f "$zip" ] || { echo "missing $zip"; ls -R build/dist; exit 1; }
+          case "${{ runner.os }}" in
+            Windows) plugin=watch.dll;      viewer=watch_viewer.exe ;;
+            macOS)   plugin=libwatch.dylib; viewer=watch_viewer     ;;
+            *)       plugin=libwatch.so;    viewer=watch_viewer     ;;
+          esac
+          # `cmake -E tar t` avoids depending on unzip/7z being on PATH.
+          cmake -E tar tf "$zip" > listing.txt
+          cat listing.txt
+          for f in "$plugin" "$viewer"; do
+            grep -qx "$f" listing.txt || { echo "missing from archive: $f"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watch-csound7-${{ matrix.platform }}
+          path: build/dist/watch-csound7-${{ matrix.platform }}.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/dist/watch-csound7-${{ matrix.platform }}.zip

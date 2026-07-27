@@ -8,7 +8,6 @@
     "watchcontrol",
     "watchspectrum",
     "watchspectrogram",
-    "watchpoint",
     "watchmeter",
     "watchadd",
     "watchtheme"
@@ -52,25 +51,25 @@
     {
       "name": "watch-viewer-linux-x86_64",
       "platform": "linux-x86_64",
-      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v1.0.0/watch-csound7-linux-x86_64.zip",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v${version}/watch-csound7-linux-x86_64.zip",
       "extractpath": "watch_viewer"
     },
     {
       "name": "watch-viewer-windows-x86_64",
       "platform": "windows-x86_64",
-      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v1.0.0/watch-csound7-windows-x86_64.zip",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v${version}/watch-csound7-windows-x86_64.zip",
       "extractpath": "watch_viewer.exe"
     },
     {
       "name": "watch-viewer-macos-x86_64",
       "platform": "macos-x86_64",
-      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v1.0.0/watch-csound7-macos-universal.zip",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v${version}/watch-csound7-macos-universal.zip",
       "extractpath": "watch_viewer"
     },
     {
       "name": "watch-viewer-macos-arm64",
       "platform": "macos-arm64",
-      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v1.0.0/watch-csound7-macos-universal.zip",
+      "url": "https://github.com/PasqualeMainolfi/csound-watch/releases/download/v${version}/watch-csound7-macos-universal.zip",
       "extractpath": "watch_viewer"
     }
   ]
