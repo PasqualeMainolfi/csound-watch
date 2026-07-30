@@ -130,6 +130,7 @@ int32_t watch_process_launch_viewer(void) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -146,6 +147,39 @@ static int32_t executable_file(const char *path) {
     return path != NULL
         && path[0] != '\0'
         && access(path, X_OK) == 0;
+}
+
+/*
+ * risset unpacks its assets with Python's zipfile, which discards the mode bits
+ * recorded in the archive, so the viewer can be installed without its execute
+ * permission. Restore it instead of reporting a viewer that is not there.
+ */
+static int32_t executable_asset_file(const char *path) {
+    if (executable_file(path)) {
+        return 1;
+    }
+
+    struct stat info;
+    if (stat(path, &info) != 0 || !S_ISREG(info.st_mode)) {
+        return 0;
+    }
+
+    mode_t mode = info.st_mode & 07777;
+    if (mode & S_IRUSR) {
+        mode |= S_IXUSR;
+    }
+    if (mode & S_IRGRP) {
+        mode |= S_IXGRP;
+    }
+    if (mode & S_IROTH) {
+        mode |= S_IXOTH;
+    }
+
+    if (chmod(path, mode) != 0) {
+        return 0;
+    }
+
+    return executable_file(path);
 }
 
 static int32_t join_path(
@@ -194,7 +228,7 @@ static int32_t risset_viewer_path(char path[PATH_MAX]) {
 #endif
 
     int written = snprintf(path, PATH_MAX, "%s%s", home, suffix);
-    return written > 0 && written < PATH_MAX && executable_file(path);
+    return written > 0 && written < PATH_MAX && executable_asset_file(path);
 }
 
 static int32_t path_viewer_path(char path[PATH_MAX]) {
