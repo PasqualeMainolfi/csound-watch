@@ -1,6 +1,6 @@
 {
   "name": "watch",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "opcodes": [
     "watchtable",
     "watchpoint",

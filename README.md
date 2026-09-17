@@ -523,18 +523,21 @@ The archive is written under `build/dist` and contains:
 On macOS or Linux:
 
 ```sh
-OPCODE7DIR64="$PWD/build" csound examples/watchscope.csd
+OPCODE7DIR64="$PWD/build" CS_USER_PLUGINDIR="$PWD/build" csound examples/watchscope.csd
 ```
 
 In Windows PowerShell:
 
 ```powershell
 $env:OPCODE7DIR64 = "$PWD\build"
+$env:CS_USER_PLUGINDIR = "$PWD\build"
 csound examples\watchscope.csd
 ```
 
 Because the viewer is next to the plugin in the build directory, it is found
 automatically.
+Setting `CS_USER_PLUGINDIR` to the same directory keeps an older installed copy
+of the plugin out of this run.
 
 The viewer can also be launched independently:
 
@@ -552,12 +555,14 @@ They are run like any other orchestra and, where the checks are numeric, report
 a summary through Csound's `--run-unit-tests` assertion opcodes:
 
 ```sh
-OPCODE7DIR64="$PWD/build" csound utest/registry.csd
+OPCODE7DIR64="$PWD/build" CS_USER_PLUGINDIR="$PWD/build" csound utest/registry.csd
+OPCODE7DIR64="$PWD/build" CS_USER_PLUGINDIR="$PWD/build" csound utest/registry_capacity.csd
 ```
 
 | File | Area |
 |---|---|
-| [`registry.csd`](utest/registry.csd) | Handle allocation and graph-registry capacity |
+| [`registry.csd`](utest/registry.csd) | Graph handle allocation |
+| [`registry_capacity.csd`](utest/registry_capacity.csd) | Graph-registry capacity in a fresh Csound instance |
 | [`scope_stream.csd`](utest/scope_stream.csd) | Audio streams at `ksmps = 1` and file playback |
 | [`control.csd`](utest/control.csd) | Control packets, multiple streams, residual flush |
 | [`control_ranges.csd`](utest/control_ranges.csd) | Asymmetric and strictly positive y ranges, `expseg` envelopes |
@@ -684,7 +689,7 @@ cmake -S . -B build \
 Confirm that Csound is loading the build or installation directory:
 
 ```sh
-OPCODE7DIR64="$PWD/build" csound examples/watchscope.csd
+OPCODE7DIR64="$PWD/build" CS_USER_PLUGINDIR="$PWD/build" csound examples/watchscope.csd
 ```
 
 Also confirm that the plugin was built against the Csound 7 API and with the

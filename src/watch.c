@@ -570,8 +570,9 @@ static WATCH_MANAGER *get_manager(CSOUND *csound) {
         goto failed_socket;
     }
 
-    if (csound->RegisterResetCallback(csound, manager, manager_reset) != OK) {
-        csound->ErrorMsg(csound, "[watch] reset callback registration failed\n");
+    int32_t reset_result = csound->RegisterResetCallback(csound, manager, manager_reset);
+    if (reset_result != OK) {
+        csound->ErrorMsg(csound, "[watch] reset callback registration failed (error %d)\n", reset_result);
         atomic_store_explicit(&manager->running, false, memory_order_release);
         csound->JoinThread(manager->sender_thread);
         manager->sender_thread = NULL;

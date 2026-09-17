@@ -35,7 +35,6 @@ endin
 
 </CsInstruments>
 <CsScore>
-f0 3600
 ; At kr = 1500 Hz, this produces several complete 256-sample packets and a
 ; final partial packet for each stream.
 i "ControlStreams" 0 5
