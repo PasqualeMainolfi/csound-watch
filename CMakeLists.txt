@@ -55,14 +55,15 @@ message(STATUS "watch: Csound headers at ${CSOUND_INCLUDE_DIR}")
 
 # csound.h #includes a *generated* version.h. A proper Csound install ships it in
 # the include dir; a raw source checkout generates it elsewhere (e.g. under
-# Android/CsoundAndroid/jni). Make sure it is reachable, else the build fails with
+# platform/android/CsoundAndroid/jni, Android/CsoundAndroid/jni before 7.0.0).
+# Make sure it is reachable, else the build fails with
 # "version.h file not found".
 set(CSOUND_EXTRA_INCLUDE_DIRS "" CACHE STRING
     "Extra Csound include dirs (semicolon-separated), e.g. the dir holding a generated version.h")
 if(NOT EXISTS "${CSOUND_INCLUDE_DIR}/version.h")
     find_file(CSOUND_VERSION_H version.h
         PATHS "${CSOUND_INCLUDE_DIR}/.."
-        PATH_SUFFIXES Android/CsoundAndroid/jni
+        PATH_SUFFIXES platform/android/CsoundAndroid/jni Android/CsoundAndroid/jni
         NO_DEFAULT_PATH)
     if(CSOUND_VERSION_H)
         get_filename_component(_vdir "${CSOUND_VERSION_H}" DIRECTORY)

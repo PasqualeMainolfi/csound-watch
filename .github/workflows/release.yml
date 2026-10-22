@@ -13,7 +13,7 @@ permissions:
 env:
   # Csound source ref to take headers from. Pinned to the Csound 7 tag whose
   # headers this plugin was built and verified against (also the runtime Csound).
-  CSOUND_REF: 7.0.0-beta.17
+  CSOUND_REF: 7.0.0
 
 jobs:
   build:
@@ -60,7 +60,10 @@ jobs:
           args=(-S . -B build -DCMAKE_BUILD_TYPE=Release
                 -DCSOUND_INCLUDE_DIR="${GITHUB_WORKSPACE}/csound-src/include"
                 -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
-          [ -n "${{ matrix.arch }}" ] && args+=(-DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}")
+          # Without an explicit target the macOS binaries require the runner's
+          # macOS version. 12.0 matches the minimum of the Csound 7 framework.
+          [ -n "${{ matrix.arch }}" ] && args+=(-DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}"
+                                                -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0)
           cmake "${args[@]}"
 
       - name: Build

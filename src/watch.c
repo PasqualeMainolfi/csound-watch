@@ -669,13 +669,13 @@ unlock:
     return result;
 }
 
-static int32_t tick_count(CSOUND *csound, const MYFLT *value, const char *name, uint32_t *result) {
+static int32_t tick_count(CSOUND *csound, const cs_float *value, const char *name, uint32_t *result) {
     if (value == NULL) {
         *result = 0;
         return OK;
     }
 
-    if (!isfinite((double) *value) || *value < FL(0.0) || *value > (MYFLT) MAX_GRID_TICKS) {
+    if (!isfinite((double) *value) || *value < FL(0.0) || *value > (cs_float) MAX_GRID_TICKS) {
         return csound->InitError(csound, "[watch] %s must be between 0 and %u", name, MAX_GRID_TICKS);
     }
 
@@ -685,8 +685,8 @@ static int32_t tick_count(CSOUND *csound, const MYFLT *value, const char *name, 
 
 static int32_t numeric_range(
     CSOUND *csound,
-    const MYFLT *min_value,
-    const MYFLT *max_value,
+    const cs_float *min_value,
+    const cs_float *max_value,
     const char *name,
     float lower_bound,
     float upper_bound,
@@ -698,14 +698,14 @@ static int32_t numeric_range(
     range->max = 0.0f;
 
     if (min_value != NULL) {
-        if (!isfinite((double) *min_value) || *min_value < (MYFLT) lower_bound || *min_value > (MYFLT) upper_bound) {
+        if (!isfinite((double) *min_value) || *min_value < (cs_float) lower_bound || *min_value > (cs_float) upper_bound) {
             return csound->InitError(csound, "[watch] %s minimum is outside the supported range", name);
         }
         range->min = (float) *min_value;
     }
 
     if (max_value != NULL) {
-        if (!isfinite((double) *max_value) || *max_value < (MYFLT) lower_bound || *max_value > (MYFLT) upper_bound) {
+        if (!isfinite((double) *max_value) || *max_value < (cs_float) lower_bound || *max_value > (cs_float) upper_bound) {
             return csound->InitError(csound, "[watch] %s maximum is outside the supported range", name);
         }
         range->max = (float) *max_value;
@@ -720,7 +720,7 @@ static int32_t numeric_range(
 
 static int32_t create_graph(
     CSOUND *csound,
-    MYFLT *handle,
+    cs_float *handle,
     WATCH_SIGNAL_DOMAIN domain,
     const WATCH_MSG_GRAPH_SETTINGS *settings,
     const STRINGDAT *title,
@@ -735,7 +735,7 @@ static int32_t create_graph(
      */
     if (handle != NULL) {
         request_graph_destroy(csound, (uint32_t) *handle, true);
-        *handle = (MYFLT) INVALID_HANDLE;
+        *handle = (cs_float) INVALID_HANDLE;
     }
 
     WATCH_MANAGER *manager = get_manager(csound);
@@ -832,16 +832,16 @@ int32_t watch_create_scope(CSOUND *csound, WATCH_CREATE_TIME *p) {
 
 static int32_t create_spectral_graph(
     CSOUND *csound,
-    MYFLT *handle,
+    cs_float *handle,
     WATCH_SIGNAL_DOMAIN domain,
     float history_seconds,
-    const MYFLT *min_frequency,
-    const MYFLT *max_frequency,
-    const MYFLT *min_value,
-    const MYFLT *max_value,
-    const MYFLT *scale_value,
-    const MYFLT *nxticks_value,
-    const MYFLT *nyticks_value,
+    const cs_float *min_frequency,
+    const cs_float *max_frequency,
+    const cs_float *min_value,
+    const cs_float *max_value,
+    const cs_float *scale_value,
+    const cs_float *nxticks_value,
+    const cs_float *nyticks_value,
     const STRINGDAT *title,
     float sample_rate
 ) {
@@ -852,9 +852,9 @@ static int32_t create_spectral_graph(
     config->scale = WATCH_SCALE_LINEAR_GAIN;
     if (scale_value != NULL) {
         if (!isfinite((double) *scale_value)
-            || *scale_value < (MYFLT) WATCH_SCALE_LINEAR_GAIN
-            || *scale_value > (MYFLT) WATCH_SCALE_DECIBEL
-            || *scale_value != (MYFLT) (uint32_t) *scale_value) {
+            || *scale_value < (cs_float) WATCH_SCALE_LINEAR_GAIN
+            || *scale_value > (cs_float) WATCH_SCALE_DECIBEL
+            || *scale_value != (cs_float) (uint32_t) *scale_value) {
             return csound->InitError(csound, "[watch] spectral scale must be 0 (gain), 1 (power), or 2 (dB)");
         }
         config->scale = (WATCH_SPECTRAL_SCALE) *scale_value;
@@ -905,7 +905,7 @@ int32_t watch_create_spectrogram(CSOUND *csound, WATCH_CREATE_SPECTROGRAM *p) {
     if (p->history_seconds == NULL
         || !isfinite((double) *p->history_seconds)
         || *p->history_seconds <= FL(0.0)
-        || *p->history_seconds > (MYFLT) FLT_MAX) {
+        || *p->history_seconds > (cs_float) FLT_MAX) {
         return csound->InitError(csound, "[watch] spectrogram history must be greater than zero seconds");
     }
 
@@ -928,7 +928,7 @@ int32_t watch_create_spectrogram(CSOUND *csound, WATCH_CREATE_SPECTROGRAM *p) {
 
 static int32_t create_stream(
     CSOUND *csound,
-    const MYFLT *handle,
+    const cs_float *handle,
     WATCH_SIGNAL_DOMAIN first_domain,
     WATCH_SIGNAL_DOMAIN second_domain,
     float sample_rate,
@@ -1297,7 +1297,7 @@ int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p) {
      * cell, so create_graph() cannot see it and the teardown is done here.
      */
     ftable_teardown(csound, p, true);
-    MYFLT graph_handle = (MYFLT) INVALID_HANDLE;
+    cs_float graph_handle = (cs_float) INVALID_HANDLE;
     FUNC *f = csound->FTFind(csound, p->ftable);
     if (f == NULL || f->ftable == NULL || f->flen <= 0) {
         return csound->InitError(csound, "[watch] Table not found");
@@ -1317,8 +1317,8 @@ int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p) {
 
     if (p->theme != NULL
         && (!isfinite((double) *p->theme)
-            || (*p->theme != (MYFLT) WATCH_THEME_LIGHT
-                && *p->theme != (MYFLT) WATCH_THEME_DARK))) {
+            || (*p->theme != (cs_float) WATCH_THEME_LIGHT
+                && *p->theme != (cs_float) WATCH_THEME_DARK))) {
         return csound->InitError(csound, "[watch] theme must be 0 (light) or 1 (dark)");
     }
 
@@ -1336,7 +1336,7 @@ int32_t watch_ftable(CSOUND *csound, WATCH_FTABLE *p) {
 
     result = create_graph(csound, &graph_handle, WATCH_DOMAIN_FTABLE, &settings, p->title, theme_id);
 
-    if (result != OK || graph_handle == (MYFLT) INVALID_HANDLE) {
+    if (result != OK || graph_handle == (cs_float) INVALID_HANDLE) {
         csound->Free(csound, snapshot);
         return result;
     }
@@ -1403,13 +1403,13 @@ int32_t watch_theme(CSOUND *csound, WATCH_THEME *p) {
     if (p->handle == NULL
         || !isfinite((double) *p->handle)
         || *p->handle < FL(1.0)
-        || *p->handle > (MYFLT) MAX_HANDLE_ID
-        || *p->handle != (MYFLT) (uint32_t) *p->handle) {
+        || *p->handle > (cs_float) MAX_HANDLE_ID
+        || *p->handle != (cs_float) (uint32_t) *p->handle) {
         return csound->InitError(csound, "[watch] invalid graph handle");
     }
     if (p->theme == NULL
         || !isfinite((double) *p->theme)
-        || (*p->theme != (MYFLT) WATCH_THEME_LIGHT && *p->theme != (MYFLT) WATCH_THEME_DARK)) {
+        || (*p->theme != (cs_float) WATCH_THEME_LIGHT && *p->theme != (cs_float) WATCH_THEME_DARK)) {
         return csound->InitError(csound, "[watch] theme must be 0 (light) or 1 (dark)");
     }
 
@@ -1601,7 +1601,7 @@ int32_t watch_add_p(CSOUND *csound, WATCH_ADD_POINT *p) {
 static int32_t meter_teardown(CSOUND *csound, WATCH_METER *p, bool close_window) {
     release_stream(csound, &p->stream);
     request_graph_destroy(csound, (uint32_t) *p->handle, close_window);
-    *p->handle = (MYFLT) INVALID_HANDLE;
+    *p->handle = (cs_float) INVALID_HANDLE;
     return OK;
 }
 
@@ -1642,7 +1642,7 @@ int32_t watch_meter_init(CSOUND *csound, WATCH_METER *p) {
      * meter is read either as a gain or in decibels.
      */
     uint32_t scale = (uint32_t) *p->scale;
-    if (*p->scale != (MYFLT) scale
+    if (*p->scale != (cs_float) scale
         || (scale != WATCH_SCALE_LINEAR_GAIN && scale != WATCH_SCALE_DECIBEL)) {
         return csound->InitError(
             csound,

@@ -101,52 +101,52 @@ typedef struct {
 typedef struct {
     OPDS h;
     // outputs
-    MYFLT *handle; // 0 if the graph could not be created
+    cs_float *handle; // 0 if the graph could not be created
     // inputs
-    MYFLT *win_size;   // time interval to show
-    MYFLT *nxticks;    // i-optional
-    MYFLT *nyticks;    // i-optional
-    MYFLT *ymin;       // i-optional
-    MYFLT *ymax;       // i-optional
+    cs_float *win_size;   // time interval to show
+    cs_float *nxticks;    // i-optional
+    cs_float *nyticks;    // i-optional
+    cs_float *ymin;       // i-optional
+    cs_float *ymax;       // i-optional
     STRINGDAT *title;  // S-optional
 } WATCH_CREATE_TIME;
 
 typedef struct {
     OPDS h;
     // outputs
-    MYFLT *handle; // 0 if the graph could not be created
+    cs_float *handle; // 0 if the graph could not be created
     // inputs
-    MYFLT *min_frequency; // i-optional; automatic when omitted
-    MYFLT *max_frequency; // i-optional; automatic when omitted
-    MYFLT *min_value;     // i-optional; expressed in the selected scale
-    MYFLT *max_value;     // i-optional; expressed in the selected scale
-    MYFLT *scale;         // i-optional; WATCH_SCALE_LINEAR_GAIN by default
-    MYFLT *nxticks;       // i-optional
-    MYFLT *nyticks;       // i-optional
+    cs_float *min_frequency; // i-optional; automatic when omitted
+    cs_float *max_frequency; // i-optional; automatic when omitted
+    cs_float *min_value;     // i-optional; expressed in the selected scale
+    cs_float *max_value;     // i-optional; expressed in the selected scale
+    cs_float *scale;         // i-optional; WATCH_SCALE_LINEAR_GAIN by default
+    cs_float *nxticks;       // i-optional
+    cs_float *nyticks;       // i-optional
     STRINGDAT *title;     // S-optional
 } WATCH_CREATE_SPECTRAL;
 
 typedef struct {
     OPDS h;
     // outputs
-    MYFLT *handle; // 0 if the graph could not be created
+    cs_float *handle; // 0 if the graph could not be created
     // inputs
-    MYFLT *history_seconds;
-    MYFLT *min_frequency; // i-optional; automatic when omitted
-    MYFLT *max_frequency; // i-optional; automatic when omitted
-    MYFLT *min_value;     // i-optional; expressed in the selected scale
-    MYFLT *max_value;     // i-optional; expressed in the selected scale
-    MYFLT *scale;         // i-optional; WATCH_SCALE_LINEAR_GAIN by default
-    MYFLT *nxticks;       // i-optional
-    MYFLT *nyticks;       // i-optional
+    cs_float *history_seconds;
+    cs_float *min_frequency; // i-optional; automatic when omitted
+    cs_float *max_frequency; // i-optional; automatic when omitted
+    cs_float *min_value;     // i-optional; expressed in the selected scale
+    cs_float *max_value;     // i-optional; expressed in the selected scale
+    cs_float *scale;         // i-optional; WATCH_SCALE_LINEAR_GAIN by default
+    cs_float *nxticks;       // i-optional
+    cs_float *nyticks;       // i-optional
     STRINGDAT *title;     // S-optional
 } WATCH_CREATE_SPECTROGRAM;
 
 typedef struct {
     OPDS h;
     // inputs
-    MYFLT *handle;
-    MYFLT *signal;
+    cs_float *handle;
+    cs_float *signal;
     // private
     WATCH_STREAM *stream;
 } WATCH_ADD_TIME;
@@ -154,7 +154,7 @@ typedef struct {
 typedef struct {
     OPDS h;
     // inputs
-    MYFLT *handle;
+    cs_float *handle;
     PVSDAT *signal;
     // private
     WATCH_STREAM *stream;
@@ -167,10 +167,10 @@ typedef struct {
 typedef struct {
     OPDS h;
     // inputs
-    MYFLT *ftable;
-    MYFLT *ymin;       // i-optional
-    MYFLT *ymax;       // i-optional
-    MYFLT *theme;      // i-optional
+    cs_float *ftable;
+    cs_float *ymin;       // i-optional
+    cs_float *ymax;       // i-optional
+    cs_float *theme;      // i-optional
     STRINGDAT *title;  // S-optional
     // private
     WATCH_STREAM *stream;
@@ -180,9 +180,9 @@ typedef struct {
 typedef struct {
     OPDS h;
     // inputs
-    MYFLT *ftable;
-    MYFLT *ymin;
-    MYFLT *ymax;
+    cs_float *ftable;
+    cs_float *ymin;
+    cs_float *ymax;
     STRINGDAT *title;
     // private
     WATCH_STREAM *stream;
@@ -192,28 +192,28 @@ typedef struct {
 typedef struct {
     OPDS h;
     // inputs
-    MYFLT *handle;
-    MYFLT *theme;
+    cs_float *handle;
+    cs_float *theme;
 } WATCH_THEME;
 
 typedef struct {
     OPDS h;
     // outputs
-    MYFLT *handle;
+    cs_float *handle;
     // inputs
-    MYFLT *xmin;
-    MYFLT *xmax;
-    MYFLT *ymin;
-    MYFLT *ymax;
+    cs_float *xmin;
+    cs_float *xmax;
+    cs_float *ymin;
+    cs_float *ymax;
     STRINGDAT *title;
 } WATCH_CREATE_POINT;
 
 typedef struct {
     OPDS h;
     // inputs
-    MYFLT *handle;
-    MYFLT *x;
-    MYFLT *y;
+    cs_float *handle;
+    cs_float *x;
+    cs_float *y;
     // private
     WATCH_STREAM *stream;
 } WATCH_ADD_POINT;
@@ -227,12 +227,12 @@ typedef struct {
 typedef struct {
     OPDS h;
     // outputs
-    MYFLT *handle;
+    cs_float *handle;
     // inputs
     ARRAYDAT *channels; // k-rate levels, already in the unit of the graph
-    MYFLT *min_value;
-    MYFLT *max_value;
-    MYFLT *scale; // linear gain or decibel
+    cs_float *min_value;
+    cs_float *max_value;
+    cs_float *scale; // linear gain or decibel
     STRINGDAT *title;
     // private
     WATCH_STREAM *stream;

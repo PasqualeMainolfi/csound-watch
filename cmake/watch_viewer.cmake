@@ -94,6 +94,13 @@ endif()
 set_property(TARGET watch_viewer PROPERTY C_STANDARD 11)
 set_property(TARGET watch_viewer PROPERTY C_STANDARD_REQUIRED ON)
 
+# The plugin looks for the viewer next to itself first, so install it into the
+# plugin dir when both are built. A viewer-only build goes to <prefix>/bin.
+if(BUILD_WATCH_OPCODES AND PLUGIN_INSTALL_DIR)
+    set(WATCH_VIEWER_INSTALL_DIR "${PLUGIN_INSTALL_DIR}")
+else()
+    set(WATCH_VIEWER_INSTALL_DIR bin)
+endif()
 install(TARGETS watch_viewer
-    RUNTIME DESTINATION bin
+    RUNTIME DESTINATION "${WATCH_VIEWER_INSTALL_DIR}"
     BUNDLE DESTINATION .)

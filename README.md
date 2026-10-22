@@ -29,12 +29,10 @@ one another. The standalone viewer is launched automatically when it is needed
 and normally terminates shortly after Csound stops.
 
 > [!NOTE]
-> The published `v1.0.2` binaries were built against the Csound
-> `7.0.0-beta.17` plugin ABI. The source on `main` has been built and tested
-> against a newer Csound 7 development build (`7d7006f`, September 2026).
-> Both report API 7.0, but their plugin ABI differs. For the newer Csound,
-> build Watch from this repository using headers from the Csound build you run;
-> a prebuilt release for that ABI is not available yet.
+> Csound Watch targets the Csound 7 plugin API. Release `v1.0.3` is built
+> against the headers of the Csound `7.0.0` release. Earlier releases
+> (`v1.0.2` and older) were built against `7.0.0-beta.17`, whose plugin ABI
+> differs, so use them only with that beta.
 
 ## Features
 
@@ -498,15 +496,17 @@ The plugin-only build still requires a compatible viewer at runtime.
 
 ### Install
 
-The CMake install step copies the plugin into the platform-specific user Csound
-directory and installs the viewer under the selected prefix:
+The CMake install step copies the plugin and the viewer into the
+platform-specific user Csound plugin directory, so the plugin finds the viewer
+next to itself:
 
 ```sh
-cmake --install build --prefix "$HOME/.local"
+cmake --install build
 ```
 
-Make sure the prefix's `bin` directory is in `PATH`, or set
-`CSOUND_WATCH_VIEWER` explicitly.
+A viewer-only build (`-DBUILD_WATCH_OPCODES=OFF`) installs the viewer under
+`<prefix>/bin` instead. In that case make sure that directory is in `PATH`, or
+set `CSOUND_WATCH_VIEWER` explicitly.
 
 ### Create a release package
 
@@ -698,7 +698,7 @@ OPCODE7DIR64="$PWD/build" CS_USER_PLUGINDIR="$PWD/build" csound examples/watchsc
 ```
 
 Also confirm that the plugin was built against the Csound 7 API and with the
-same `MYFLT` precision as the running Csound installation. `USE_DOUBLE` is
+same `cs_float` precision as the running Csound installation. `USE_DOUBLE` is
 enabled by default.
 
 ### The viewer cannot be launched
